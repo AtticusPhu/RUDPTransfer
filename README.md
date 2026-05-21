@@ -1,3 +1,8 @@
+Copyright (c) 2026 AtticusPhu. All rights reserved.
+
+This repository is published for demonstration, academic, and review purposes only.
+No permission is granted to copy, modify, distribute, sublicense, or use this code commercially without written permission from the author.
+
 # RUDPTransfer Kivy + NSIS Windows Folder Build
 
 This package is a Windows-oriented Kivy GUI version of the RUDP file-transfer tool.
