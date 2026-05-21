@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+*.spec.bak
+
+# PyInstaller / installer temporary files
+*.toc
+*.manifest
+*.pkg
+
+# Runtime data
+received/
+approvals/
+*.part
+
+# RUDP identity / trust files
+*.key
+*.pin
+rudp_receiver_ed25519.key
+rudp_receiver_ed25519.pin
+
+# Local archives and generated packages
+*.zip
+*.7z
+*.rar
+*.exe
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
