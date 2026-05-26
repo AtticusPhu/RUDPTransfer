@@ -34,6 +34,8 @@ from file_transfer_common import (
     SEQ_FIRST_BODY,
     SEQ_HEADER,
     build_file_header,
+    build_user_error,
+    build_user_status,
     parse_transfer_decision,
     print_local_ip_candidates,
     sha256_file,
@@ -85,11 +87,17 @@ def _store_pinned_server_pub(path: str, pub_bytes: bytes) -> None:
 
 
 def make_server_identity_validator(pin_file: str, logger, require_existing_pin: bool = False):
-    state = {"pinned": _load_pinned_server_pub(pin_file), "announced": False}
+    state = {
+        "pinned": _load_pinned_server_pub(pin_file),
+        "announced": False,
+        "identity_mismatch": None,
+        "pin_file": str(pin_file or ""),
+    }
 
     def validator(server_pub: bytes) -> bool:
         server_pub = bytes(server_pub or b"")
         if len(server_pub) != 32:
+            state["identity_mismatch"] = {"reason": "invalid_receiver_identity", "pin_file": str(pin_file or "")}
             return False
         pinned = state.get("pinned")
         fingerprint = _sha256_hex_bytes(server_pub)
@@ -99,16 +107,24 @@ def make_server_identity_validator(pin_file: str, logger, require_existing_pin: 
                 return False
             _store_pinned_server_pub(pin_file, server_pub)
             state["pinned"] = server_pub
-            logger.info(f"Pinned receiver identity by TOFU: fingerprint={fingerprint}")
+            logger.info(f"Pinned receiver identity by TOFU: fingerprint={fingerprint}, pin_file={pin_file}")
             return True
         if pinned != server_pub:
-            logger.error(f"Pinned receiver key mismatch: expected={_sha256_hex_bytes(pinned)} got={fingerprint}")
+            expected = _sha256_hex_bytes(pinned)
+            state["identity_mismatch"] = {
+                "reason": "receiver_identity_changed",
+                "expected": expected,
+                "got": fingerprint,
+                "pin_file": str(pin_file or ""),
+            }
+            logger.error(f"Pinned receiver key mismatch: expected={expected} got={fingerprint} pin_file={pin_file}")
             return False
         if not state.get("announced"):
             state["announced"] = True
-            logger.info(f"Verified pinned receiver identity: fingerprint={fingerprint}")
+            logger.info(f"Verified pinned receiver identity: fingerprint={fingerprint}, pin_file={pin_file}")
         return True
 
+    validator.state = state  # type: ignore[attr-defined]
     return validator
 
 
@@ -164,6 +180,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--request-timeout", type=float, default=300.0, help="Seconds to wait for receiver approval after sending metadata")
     p.add_argument("--no-request-confirmation", action="store_true", help="Do not wait for receiver approval before sending file body")
     p.add_argument("--stats-interval", type=float, default=1.0)
+    p.add_argument("--no-progress-timeout", type=float, default=120.0, help="Fail if sender sees no effective transfer progress for this many seconds")
     p.add_argument("--server-pin-file", default="./rudp_receiver_ed25519.pin", help="TOFU receiver public-key pin file")
     p.add_argument("--require-existing-server-pin", action="store_true")
     p.add_argument("--disable-cc", action="store_true", help="Disable CUBIC congestion control")
@@ -177,7 +194,7 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def _wait_for_handshake(session: ReliableUDPSession, args, logger) -> None:
+def _wait_for_handshake(session: ReliableUDPSession, args, logger, validator=None) -> None:
     session.begin_client_handshake(
         initial_rto=float(args.handshake_timeout),
         max_retries=max(0, int(args.handshake_max_retries)),
@@ -185,13 +202,29 @@ def _wait_for_handshake(session: ReliableUDPSession, args, logger) -> None:
         final_ack_rto_cap=max(float(args.handshake_timeout), min(float(args.handshake_tail_timeout), 60.0)),
     )
 
+    def check_identity_mismatch() -> None:
+        state = getattr(validator, "state", {}) if validator is not None else {}
+        mismatch = state.get("identity_mismatch") if isinstance(state, dict) else None
+        if mismatch:
+            try:
+                session.abort("receiver_identity_changed")
+            except Exception:
+                pass
+            expected = str(mismatch.get("expected") or "")
+            got = str(mismatch.get("got") or "")
+            pin_file = str(mismatch.get("pin_file") or "")
+            detail = f"expected={expected} got={got} pin_file={pin_file}"
+            raise RuntimeError("receiver_identity_changed:" + detail)
+
     while not session.wait_session_key_ready(timeout=0.1):
+        check_identity_mismatch()
         if session.has_fatal_error():
             raise RuntimeError(session.get_fatal_error() or "fatal protocol error during handshake")
         if not session.running:
             raise RuntimeError("session stopped during handshake")
 
     while not session.wait_peer_established(timeout=0.1):
+        check_identity_mismatch()
         if session.has_fatal_error():
             raise RuntimeError(session.get_fatal_error() or "fatal protocol error while confirming handshake")
         if not session.running:
@@ -200,7 +233,7 @@ def _wait_for_handshake(session: ReliableUDPSession, args, logger) -> None:
     logger.info("Handshake established")
 
 
-def _wait_for_receiver_decision(session: ReliableUDPSession, timeout: float, logger) -> None:
+def _wait_for_receiver_decision(session: ReliableUDPSession, timeout: float, logger) -> dict:
     deadline = time.time() + max(1.0, float(timeout or 300.0))
     logger.info("Transfer request submitted; waiting for receiver approval")
     while time.time() < deadline:
@@ -217,13 +250,21 @@ def _wait_for_receiver_decision(session: ReliableUDPSession, timeout: float, log
         except Exception:
             continue
         if bool(decision.get("accepted")):
-            logger.info("Receiver accepted transfer; starting file body transmission")
-            return
+            resume_offset = max(0, int(decision.get("resume_offset") or 0))
+            if bool(decision.get("resume")) and resume_offset > 0:
+                logger.info(
+                    f"Receiver accepted transfer; resuming from offset={resume_offset} "
+                    f"({float(decision.get('resume_pct') or 0.0):.2f}%)"
+                )
+                logger.info(build_user_status("resume_enabled", "Receiver requested resume", resume_offset=resume_offset, resume_pct=float(decision.get("resume_pct") or 0.0)))
+            else:
+                logger.info("Receiver accepted transfer; starting file body transmission")
+            return decision
         reason = str(decision.get("reason") or "rejected")
         session.abort("receiver_rejected")
-        raise PermissionError(f"receiver rejected transfer: {reason}")
+        raise PermissionError(f"{reason}")
     session.abort("receiver_approval_timeout")
-    raise TimeoutError("receiver approval timeout")
+    raise TimeoutError("approval_timeout")
 
 
 
@@ -259,20 +300,40 @@ def run_client(args: argparse.Namespace) -> int:
     if len(header_msg) > MAX_DATA_APP_PAYLOAD:
         raise ValueError(f"file metadata header too large: {len(header_msg)} bytes")
 
-    total_data_pkts = int(math.ceil(total_bytes / payload_size)) if total_bytes > 0 else 0
-    seq_eof = SEQ_FIRST_BODY + total_data_pkts
-    if seq_eof >= DATA_SEQ_UPPER_EXCLUSIVE:
-        max_total_data_pkts = MAX_DATA_SEQ - SEQ_FIRST_BODY
-        max_total_bytes = max_total_data_pkts * int(payload_size)
+    max_total_data_pkts = MAX_DATA_SEQ - SEQ_FIRST_BODY
+    max_total_bytes = max_total_data_pkts * int(payload_size)
+    if total_bytes > max_total_bytes:
         raise ValueError(f"file too large for DATA sequence space; max_total_bytes={max_total_bytes}")
 
     sock = None
     session = None
     start_ts = time.time()
+    resume_offset = 0
     bytes_sent = 0
     pkts_sent = 0
     last_report_ts = start_ts
     last_report_bytes = 0
+    last_effective_progress_ts = start_ts
+    last_unacked_snapshot = -1
+
+    def note_effective_progress(unacked_count: Optional[int] = None) -> None:
+        nonlocal last_effective_progress_ts, last_unacked_snapshot
+        try:
+            uc = int(session.get_unacked_count() if unacked_count is None and session is not None else unacked_count)
+        except Exception:
+            uc = -1
+        if uc != last_unacked_snapshot:
+            last_unacked_snapshot = uc
+            last_effective_progress_ts = time.time()
+
+    def check_no_progress(stage: str) -> None:
+        timeout = max(0.0, float(getattr(args, "no_progress_timeout", 120.0) or 0.0))
+        if timeout <= 0:
+            return
+        if time.time() - last_effective_progress_ts > timeout:
+            if session is not None:
+                session.abort("network_no_progress")
+            raise TimeoutError(f"network_no_progress:{stage}")
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -326,10 +387,8 @@ def run_client(args: argparse.Namespace) -> int:
             logger.info(f"Application rate limit: {float(args.send_rate_mbps):.3f} Mbps")
 
         session.start_threads(start_receiver=True)
-        _wait_for_handshake(session, args, logger)
-
-        session.set_complete_expectations(seq_eof, total_bytes)
-        session.send_range_announce(SEQ_HEADER, seq_eof)
+        _wait_for_handshake(session, args, logger, validator=validator)
+        note_effective_progress()
 
         def send_payload(seq: int, payload: bytes) -> None:
             if session.has_fatal_error():
@@ -353,20 +412,46 @@ def run_client(args: argparse.Namespace) -> int:
             interval_bytes = int(bytes_sent) - int(last_report_bytes)
             rate_bps = (interval_bytes / interval) if interval_bytes > 0 else ((bytes_sent / elapsed) if bytes_sent > 0 else 0.0)
             eta_text = _format_duration(remaining_bytes / rate_bps) if rate_bps > 0 else "unknown"
+            unacked_count = session.get_unacked_count()
+            note_effective_progress(unacked_count)
             logger.info(
                 f"Progress: {bytes_sent}/{total_bytes} bytes ({pct:.2f}%), "
                 f"pkts={pkts_sent}, avg={avg_mbps:.2f} Mbps, interval={int_mbps:.2f} Mbps, "
-                f"eta={eta_text}, unacked={session.get_unacked_count()}"
+                f"eta={eta_text}, unacked={unacked_count}"
             )
             last_report_ts = now
             last_report_bytes = bytes_sent
 
         send_payload(SEQ_HEADER, header_msg)
+        decision = {}
         if not bool(getattr(args, "no_request_confirmation", False)):
-            _wait_for_receiver_decision(session, float(args.request_timeout), logger)
+            decision = _wait_for_receiver_decision(session, float(args.request_timeout), logger)
+
+        resume_offset = max(0, int((decision or {}).get("resume_offset") or 0))
+        if resume_offset > total_bytes:
+            resume_offset = 0
+        # Keep the implicit offset protocol on clean payload boundaries.
+        if resume_offset > 0:
+            resume_offset -= resume_offset % payload_size
+        remaining_bytes_total = max(0, int(total_bytes) - int(resume_offset))
+        remaining_pkts = int(math.ceil(remaining_bytes_total / payload_size)) if remaining_bytes_total > 0 else 0
+        seq_eof = SEQ_FIRST_BODY + remaining_pkts
+        if seq_eof >= DATA_SEQ_UPPER_EXCLUSIVE:
+            raise ValueError(f"remaining file portion too large for DATA sequence space; seq_eof={seq_eof}")
+
+        session.set_complete_expectations(seq_eof, total_bytes)
+        session.send_range_announce(SEQ_HEADER, seq_eof)
+
+        bytes_sent = int(resume_offset)
+        last_report_bytes = int(resume_offset)
+        if resume_offset > 0:
+            logger.info(f"Resume enabled: offset={resume_offset}/{total_bytes} bytes ({resume_offset * 100.0 / max(total_bytes, 1):.2f}%)")
+        report(force=True)
 
         seq = SEQ_FIRST_BODY
         with open(input_file, "rb") as f:
+            if resume_offset > 0:
+                f.seek(resume_offset)
             while True:
                 chunk = f.read(payload_size)
                 if not chunk:
@@ -375,7 +460,9 @@ def run_client(args: argparse.Namespace) -> int:
                 bytes_sent += len(chunk)
                 pkts_sent += 1
                 seq += 1
+                last_effective_progress_ts = time.time()
                 report(force=False)
+                check_no_progress("transferring")
 
         if seq != seq_eof:
             raise AssertionError(f"seq mismatch: seq={seq}, expected={seq_eof}")
@@ -388,6 +475,7 @@ def run_client(args: argparse.Namespace) -> int:
                 session.abort("data_drain_timeout_before_eof")
                 raise TimeoutError("data drain timeout before EOF")
             report(force=False)
+            check_no_progress("waiting_ack")
             time.sleep(0.1)
 
         send_payload(seq_eof, EOF_PAYLOAD)
@@ -401,13 +489,17 @@ def run_client(args: argparse.Namespace) -> int:
                 session.abort("eof_drain_timeout")
                 raise TimeoutError("EOF drain timeout")
             report(force=False)
+            check_no_progress("waiting_ack")
             time.sleep(0.1)
 
-        if not session.wait_for_complete(timeout=float(args.complete_timeout)):
+        complete_deadline = time.time() + max(1.0, float(args.complete_timeout))
+        while not session.wait_for_complete(timeout=0.2):
             if session.has_fatal_error():
                 raise RuntimeError(session.get_fatal_error() or "fatal protocol error while waiting COMPLETE")
-            session.abort("complete_timeout")
-            raise TimeoutError("receiver COMPLETE timeout")
+            check_no_progress("waiting_complete")
+            if time.time() >= complete_deadline:
+                session.abort("complete_timeout")
+                raise TimeoutError("complete_timeout")
 
         complete_info = session.get_received_complete_info() or {}
         ok = (
@@ -421,7 +513,7 @@ def run_client(args: argparse.Namespace) -> int:
             raise RuntimeError(f"receiver COMPLETE mismatch: {complete_info}")
 
         elapsed = max(time.time() - start_ts, 1e-6)
-        logger.info(f"Transfer complete: {bytes_sent} bytes in {elapsed:.3f}s, avg={(bytes_sent * 8.0 / elapsed / 1e6):.2f} Mbps")
+        logger.info(f"Transfer complete: {bytes_sent} bytes in {elapsed:.3f}s, avg={((max(0, bytes_sent - resume_offset)) * 8.0 / elapsed / 1e6):.2f} Mbps")
         return 0
 
     finally:
@@ -437,6 +529,36 @@ def run_client(args: argparse.Namespace) -> int:
             pass
 
 
+def _classify_user_error(exc: Exception) -> tuple[str, str]:
+    text = str(exc or "")
+    if isinstance(exc, TimeoutError):
+        if "approval_timeout" in text or "receiver approval" in text:
+            return "approval_timeout", "Receiver confirmation timed out"
+        if "network_no_progress" in text:
+            return "network_no_progress", "Network made no progress for too long"
+        if "complete_timeout" in text or "COMPLETE" in text:
+            return "complete_timeout", "File data was sent, but receiver completion confirmation timed out"
+        if "EOF" in text:
+            return "eof_timeout", "EOF acknowledgement timed out"
+        if "data drain" in text:
+            return "data_drain_timeout", "Data acknowledgement timed out"
+    if "receiver_identity_changed" in text or "Pinned receiver key mismatch" in text:
+        return "receiver_identity_changed", "Receiver identity changed"
+    if "save_dir_not_writable" in text or "save_dir_create_failed" in text or "save_dir_not_directory" in text:
+        return "save_dir_not_writable", "The receiver save directory is not writable"
+    if "disk_space_not_enough" in text:
+        return "disk_space_not_enough", "The receiver does not have enough disk space"
+    if "output_open_failed" in text:
+        return "output_open_failed", "The receiver could not create the output file"
+    if isinstance(exc, PermissionError) or "receiver_rejected" in text or "rejected" in text or "file_exists_cancelled" in text:
+        return "receiver_rejected", "Receiver rejected the transfer"
+    if isinstance(exc, FileNotFoundError):
+        return "local_file_not_found", "Local file was not found"
+    if "network_no_progress" in text:
+        return "network_no_progress", "Network made no progress for too long"
+    return "transfer_failed", "Transfer failed"
+
+
 def main() -> int:
     args = build_argparser().parse_args()
     try:
@@ -444,7 +566,10 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        setup_logger("RUDP-Sender").error(f"Fatal: {exc}")
+        logger = setup_logger("RUDP-Sender")
+        code, message = _classify_user_error(exc)
+        logger.error(build_user_error(code, message, str(exc)))
+        logger.error(f"Fatal: {exc}")
         return 2
 
 

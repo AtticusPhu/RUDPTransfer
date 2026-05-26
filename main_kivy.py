@@ -45,6 +45,20 @@ def user_data_dir() -> Path:
     return path
 
 
+def receiver_pin_file(ip: str, port: int) -> Path:
+    """Return the per-receiver TOFU pin path used by the sender role.
+
+    The local receiver identity key is intentionally separate from these trust
+    records. A machine may alternate between sending and receiving, and a sender
+    may talk to multiple receivers; therefore one global pin file is unsafe.
+    """
+    pins_dir = user_data_dir() / "receiver_pins"
+    pins_dir.mkdir(parents=True, exist_ok=True)
+    raw = f"{str(ip or '').strip()}_{int(port or 9999)}"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._") or "receiver"
+    return pins_dir / f"{safe}.pin"
+
+
 def format_file_size(num_bytes: int) -> str:
     n = float(max(0, int(num_bytes)))
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
@@ -53,6 +67,29 @@ def format_file_size(num_bytes: int) -> str:
             return f"{int(n)} B" if unit == "B" else f"{n:.2f} {unit}"
         n /= 1024.0
     return f"{int(num_bytes)} B"
+
+
+
+def localized_error_key(code: str) -> str:
+    code = str(code or "transfer_failed")
+    mapping = {
+        "approval_timeout": "approval_timeout_msg",
+        "receiver_approval_timeout": "approval_timeout_msg",
+        "receiver_rejected": "receiver_rejected_msg",
+        "user_rejected": "receiver_rejected_msg",
+        "file_exists_cancelled": "receiver_rejected_msg",
+        "save_dir_not_writable": "save_dir_not_writable_msg",
+        "save_dir_create_failed": "save_dir_not_writable_msg",
+        "save_dir_not_directory": "save_dir_not_writable_msg",
+        "disk_space_not_enough": "disk_space_not_enough_msg",
+        "network_no_progress": "network_no_progress_msg",
+        "receiver_unreachable": "receiver_unreachable_msg",
+        "receiver_identity_changed": "receiver_identity_changed_msg",
+        "complete_timeout": "complete_timeout_msg",
+        "sha256_mismatch": "sha256_mismatch_msg",
+        "output_open_failed": "output_open_failed_msg",
+    }
+    return mapping.get(code, "transfer_failed")
 
 
 def configure_stdio_utf8() -> None:
@@ -134,7 +171,7 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.textinput import TextInput
 
-from file_transfer_common import DEFAULT_DISCOVERY_PORT, TRANSFER_REQUEST_LOG_PREFIX, discover_receivers, get_local_ip_candidates
+from file_transfer_common import DEFAULT_DISCOVERY_PORT, TRANSFER_REQUEST_LOG_PREFIX, USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX, discover_receivers, get_local_ip_candidates
 
 
 I18N: Dict[str, Dict[str, str]] = {
@@ -195,6 +232,24 @@ I18N: Dict[str, Dict[str, str]] = {
         "approval_hint": "发送端提交请求后，将在这里弹出确认窗口",
         "transfer_finished": "本次传输结束。",
         "receive_transfer_finished": "本次传输完成。",
+        "transfer_failed": "传输失败：{reason}",
+        "retry": "重新发送",
+        "retry_ready": "可以点击“重新发送”再次尝试。",
+        "approval_timeout_msg": "等待接收端确认超时。",
+        "receiver_rejected_msg": "接收端已拒绝本次传输。",
+        "save_dir_not_writable_msg": "接收端保存路径不可写。",
+        "disk_space_not_enough_msg": "接收端磁盘空间不足。",
+        "network_no_progress_msg": "网络长时间无进展，传输已中断。",
+        "receiver_unreachable_msg": "接收端无响应，可能已关闭或网络断开。",
+        "receiver_identity_changed_msg": "接收端身份发生变化。为避免误发文件，已停止连接。请确认接收端确实是目标设备；如设备重装或重新生成身份密钥，可删除该接收端对应的 pin 文件后重新信任。",
+        "complete_timeout_msg": "文件已发送完成，但未收到接收端完成确认。",
+        "sha256_mismatch_msg": "文件校验失败，接收文件可能不完整。",
+        "output_open_failed_msg": "接收端无法创建输出文件。",
+        "receive_idle_timeout_msg": "长时间没有收到发送端数据，接收已中断。",
+        "file_conflict": "目标文件已存在，请选择处理方式：",
+        "policy_rename": "自动重命名",
+        "policy_overwrite": "覆盖",
+        "policy_cancel": "取消",
         "native_dialog_failed": "系统文件选择窗口打开失败，已切换为内置选择窗口。",
     },
     "en": {
@@ -254,6 +309,27 @@ I18N: Dict[str, Dict[str, str]] = {
         "approval_hint": "After a sender submits a request, a confirmation dialog appears here.",
         "transfer_finished": "This transfer has finished.",
         "receive_transfer_finished": "This transfer has completed.",
+        "transfer_failed": "Transfer failed: {reason}",
+        "retry": "Retry",
+        "retry_ready": "You can click Retry to send the same file again.",
+        "approval_timeout_msg": "Receiver confirmation timed out.",
+        "receiver_rejected_msg": "The receiver rejected this transfer.",
+        "save_dir_not_writable_msg": "The receiver save directory is not writable.",
+        "disk_space_not_enough_msg": "The receiver does not have enough disk space.",
+        "network_no_progress_msg": "The network made no progress for too long; the transfer was stopped.",
+        "receiver_unreachable_msg": "The receiver is not responding; it may be closed or disconnected.",
+        "receiver_identity_changed_msg": "The receiver identity has changed. The connection was stopped to avoid sending the file to an untrusted device. Confirm the receiver is the intended device; if it was reinstalled or regenerated its identity key, delete that receiver's pin file and trust it again.",
+        "complete_timeout_msg": "File data was sent, but receiver completion confirmation timed out.",
+        "sha256_mismatch_msg": "File verification failed; the received file may be incomplete.",
+        "output_open_failed_msg": "The receiver could not create the output file.",
+        "receive_idle_timeout_msg": "No data was received from the sender for too long; receiving has stopped.",
+        "file_conflict": "Target file already exists. Choose a policy:",
+        "policy_rename": "Auto rename",
+        "policy_overwrite": "Overwrite",
+        "policy_cancel": "Cancel",
+        "policy_resume": "Resume",
+        "resume_detected": "Incomplete file found: {done} / {total} received ({pct:.2f}%).",
+        "resume_enabled": "Receiver requested resume from {offset}.",
         "native_dialog_failed": "The system file dialog failed. Falling back to the built-in chooser.",
     },
 }
@@ -561,6 +637,7 @@ class RUDPTransferRoot(BoxLayout):
         self.app = app
         self.lang = app.lang
         self.discovered: List[Dict[str, object]] = []
+        self.selected_receiver: Optional[Dict[str, object]] = None
         self.search_in_progress = False
         self.pending_request_popups = set()
         self.seen_request_files = set()
@@ -568,6 +645,9 @@ class RUDPTransferRoot(BoxLayout):
         self.approval_dir.mkdir(parents=True, exist_ok=True)
         self.sender_worker = WorkerProcess("sender", self.sender_log, self.sender_exit, self.sender_progress)
         self.receiver_worker = WorkerProcess("receiver", self.receiver_log, self.receiver_exit)
+        self.last_sender_args: Optional[List[str]] = None
+        self.last_sender_file: str = ""
+        self.last_sender_failure_code: str = ""
         self._build()
         self.refresh_texts()
         self.refresh_local_ips()
@@ -664,9 +744,12 @@ class RUDPTransferRoot(BoxLayout):
         root.add_widget(progress_box)
         action = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         self.send_btn = make_button("success", on_release=lambda *_: self.start_sender())
+        self.retry_send_btn = make_button("primary", on_release=lambda *_: self.retry_sender())
+        self.retry_send_btn.disabled = True
         self.stop_send_btn = make_button("danger", on_release=lambda *_: self.sender_worker.stop())
         self.clear_send_btn = make_button("secondary", on_release=lambda *_: self.sender_log_box.clear())
         action.add_widget(self.send_btn)
+        action.add_widget(self.retry_send_btn)
         action.add_widget(self.stop_send_btn)
         action.add_widget(self.clear_send_btn)
         root.add_widget(action)
@@ -762,6 +845,7 @@ class RUDPTransferRoot(BoxLayout):
         self.search_btn.text = self.t("search")
         self.choose_file_btn.text = self.t("choose_file")
         self.send_btn.text = self.t("send")
+        self.retry_send_btn.text = self.t("retry")
         self.stop_send_btn.text = self.t("stop")
         self.clear_send_btn.text = self.t("clear")
         self._set_row_label(self.bind_input, self.t("bind"))
@@ -885,13 +969,16 @@ class RUDPTransferRoot(BoxLayout):
         return ip, port
 
     def on_receiver_selected(self, _spinner, value: str) -> None:
+        self.selected_receiver = None
         for rec in self.discovered:
             label = self._receiver_label(rec)
             if label == value:
+                self.selected_receiver = rec
                 ip, port = self._receiver_endpoint(rec)
                 if ip:
                     self.receiver_ip.text = ip
                     self.receiver_port.text = str(port)
+                    self.sender_log_box.append(f"Selected receiver: {ip}:{port}\n")
                 return
 
     def _receiver_label(self, rec: Dict[str, object]) -> str:
@@ -912,16 +999,12 @@ class RUDPTransferRoot(BoxLayout):
         def _finish(found=None, error: Optional[str] = None):
             found = found or []
             self.discovered = found
+            self.selected_receiver = None
             values = [self._receiver_label(x) for x in found]
             self.receiver_spinner.values = values
             self.receiver_spinner.text = values[0] if values else self.t("no_receiver")
             if found:
                 self.on_receiver_selected(self.receiver_spinner, values[0])
-                ip, port = self._receiver_endpoint(found[0])
-                if ip:
-                    self.receiver_ip.text = ip
-                    self.receiver_port.text = str(port)
-                    self.sender_log_box.append(f"Selected receiver: {ip}:{port}\n")
             if error:
                 self.sender_log_box.append(f"Discovery failed: {error}\n")
             else:
@@ -953,7 +1036,29 @@ class RUDPTransferRoot(BoxLayout):
         threading.Thread(target=_run, daemon=True).start()
 
     def start_sender(self) -> None:
-        ip = self.receiver_ip.text.strip()
+        rec = getattr(self, "selected_receiver", None)
+        selected_ip = ""
+        selected_port = 9999
+        if rec is not None and self.receiver_spinner.text == self._receiver_label(rec):
+            selected_ip, selected_port = self._receiver_endpoint(rec)
+
+        ip_text = self.receiver_ip.text.strip()
+        port_text = self.receiver_port.text.strip() or "9999"
+        try:
+            port_num = int(port_text)
+        except Exception:
+            port_num = 9999
+            port_text = "9999"
+
+        if selected_ip and ip_text == selected_ip and port_num == int(selected_port):
+            ip = selected_ip
+            port_num = int(selected_port)
+            port_text = str(port_num)
+        else:
+            # Manual edits take precedence over a stale discovery selection.
+            self.selected_receiver = None
+            ip = ip_text
+
         if not ip:
             self.sender_log_box.append(self.t("need_ip") + "\n")
             return
@@ -961,18 +1066,25 @@ class RUDPTransferRoot(BoxLayout):
         if not file_path or not os.path.isfile(file_path):
             self.sender_log_box.append(self.t("need_file") + "\n")
             return
-        pin_file = str(user_data_dir() / "rudp_receiver_ed25519.pin")
+        pin_file = str(receiver_pin_file(ip, port_num))
+        self.sender_log_box.append(f"Starting sender to: {ip}:{port_num}\n")
+        self.sender_log_box.append(f"Receiver pin file: {pin_file}\n")
         args = [
             "--server-ip", ip,
-            "--server-port", self.receiver_port.text.strip() or "9999",
+            "--server-port", str(port_num),
             "--file", file_path,
             "--payload-size", self.payload_input.text.strip() or "1300",
             "--complete-timeout", self.complete_timeout_input.text.strip() or "180",
             "--final-ack-timeout", self.complete_timeout_input.text.strip() or "180",
             "--request-timeout", self.request_timeout_input.text.strip() or "300",
+            "--no-progress-timeout", "120",
             "--stats-interval", "0.5",
             "--server-pin-file", pin_file,
         ]
+        self.last_sender_args = list(args)
+        self.last_sender_file = file_path
+        self.last_sender_failure_code = ""
+        self.retry_send_btn.disabled = True
         self.progress.value = 0
         try:
             total = os.path.getsize(file_path)
@@ -980,6 +1092,28 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             pass
         self.sender_worker.start(args)
+        self.sender_log_box.append(self.t("started") + "\n")
+        self.sender_log_box.append(self.t("request_waiting") + "\n")
+
+    def retry_sender(self) -> None:
+        if self.sender_worker.is_running():
+            self.sender_log_box.append(self.t("running") + "\n")
+            return
+        if not self.last_sender_args:
+            self.sender_log_box.append(self.t("need_file") + "\n")
+            return
+        if self.last_sender_file and not os.path.isfile(self.last_sender_file):
+            self.sender_log_box.append(self.t("need_file") + "\n")
+            return
+        self.retry_send_btn.disabled = True
+        self.last_sender_failure_code = ""
+        self.progress.value = 0
+        try:
+            total = os.path.getsize(self.last_sender_file) if self.last_sender_file else 0
+            self.update_progress_labels(0, total, 0.0, self.t("unknown"), 0.0)
+        except Exception:
+            pass
+        self.sender_worker.start(list(self.last_sender_args))
         self.sender_log_box.append(self.t("started") + "\n")
         self.sender_log_box.append(self.t("request_waiting") + "\n")
 
@@ -1038,8 +1172,51 @@ class RUDPTransferRoot(BoxLayout):
         except Exception as exc:
             self.receiver_log_box.append(f"Failed to start firewall helper: {exc}\n")
 
+    def _display_user_error(self, code: str, detail: str = "", target: str = "sender") -> None:
+        key = localized_error_key(code)
+        if key == "transfer_failed":
+            msg = self.t("transfer_failed", reason=(detail or code or self.t("unknown")))
+        else:
+            msg = self.t(key)
+            if detail:
+                msg = msg + "\n" + detail
+        if target == "receiver":
+            self.receiver_log_box.append(msg + "\n")
+        else:
+            self.sender_log_box.append(msg + "\n")
+            self.last_sender_failure_code = str(code or "transfer_failed")
+            self.retry_send_btn.disabled = False
+            self.sender_log_box.append(self.t("retry_ready") + "\n")
+
+    def _try_parse_user_event(self, text: str, target: str) -> bool:
+        marker = USER_ERROR_LOG_PREFIX
+        if marker in text:
+            payload = text.split(marker, 1)[1].strip()
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                return False
+            self._display_user_error(str(obj.get("code") or "transfer_failed"), str(obj.get("detail") or obj.get("message") or ""), target=target)
+            return True
+        marker = USER_STATUS_LOG_PREFIX
+        if marker in text:
+            payload = text.split(marker, 1)[1].strip()
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                return False
+            if str(obj.get("code") or "") == "resume_enabled":
+                msg = self.t("resume_enabled", offset=format_file_size(int(obj.get("resume_offset") or 0)))
+                if target == "receiver":
+                    self.receiver_log_box.append(msg + "\n")
+                else:
+                    self.sender_log_box.append(msg + "\n")
+                return True
+        return False
+
     def sender_log(self, text: str) -> None:
         self.sender_log_box.append(text)
+        self._try_parse_user_event(text, "sender")
 
     def poll_approval_requests(self, _dt=None) -> bool:
         try:
@@ -1064,8 +1241,11 @@ class RUDPTransferRoot(BoxLayout):
 
     def receiver_log(self, text: str) -> None:
         self.receiver_log_box.append(text)
+        self._try_parse_user_event(text, "receiver")
         if "end reason=complete" in text:
             self.receiver_log_box.append(self.t("receive_transfer_finished") + "\n")
+        elif "end reason=idle_timeout" in text:
+            self.receiver_log_box.append(self.t("receive_idle_timeout_msg") + "\n")
         marker = TRANSFER_REQUEST_LOG_PREFIX
         if marker in text:
             payload = text.split(marker, 1)[1].strip()
@@ -1096,13 +1276,60 @@ class RUDPTransferRoot(BoxLayout):
         lbl = make_label(text=message, halign="left", valign="top")
         bind_label_wrap(lbl)
         content.add_widget(lbl)
+        policy_spinner = None
+        resume_available = bool(req.get("resume_available"))
+        if resume_available:
+            resume_offset = int(req.get("resume_offset") or 0)
+            total_size = int(req.get("size") or 0)
+            resume_pct = float(req.get("resume_pct") or ((resume_offset * 100.0 / max(total_size, 1)) if total_size > 0 else 0.0))
+            content.add_widget(make_label(
+                text=self.t("resume_detected", done=format_file_size(resume_offset), total=format_file_size(total_size), pct=resume_pct),
+                size_hint_y=None, height=dp(42), halign="left", valign="middle", color=THEME["muted_text"]
+            ))
+            policy_spinner = style_spinner(Spinner(
+                text=self.t("policy_resume"),
+                values=[self.t("policy_resume"), self.t("policy_overwrite"), self.t("policy_cancel")],
+                font_name=UI_FONT,
+                size_hint_y=None,
+                height=dp(38),
+            ))
+            content.add_widget(policy_spinner)
+        elif bool(req.get("conflict")):
+            content.add_widget(make_label(text=self.t("file_conflict"), size_hint_y=None, height=dp(28), halign="left", valign="middle", color=THEME["muted_text"]))
+            policy_spinner = style_spinner(Spinner(
+                text=self.t("policy_rename"),
+                values=[self.t("policy_rename"), self.t("policy_overwrite"), self.t("policy_cancel")],
+                font_name=UI_FONT,
+                size_hint_y=None,
+                height=dp(38),
+            ))
+            content.add_widget(policy_spinner)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
-        popup = style_popup(Popup(title=self.t("incoming_request_title"), title_font=UI_FONT, content=content, size_hint=(0.72, 0.55), auto_dismiss=False))
+        popup = style_popup(Popup(title=self.t("incoming_request_title"), title_font=UI_FONT, content=content, size_hint=(0.72, 0.60), auto_dismiss=False))
+
+        def _selected_policy() -> str:
+            if policy_spinner is None:
+                return "overwrite"
+            txt = str(policy_spinner.text or "")
+            if txt == self.t("policy_resume"):
+                return "resume"
+            if txt == self.t("policy_overwrite"):
+                return "overwrite"
+            if txt == self.t("policy_cancel"):
+                return "cancel"
+            return "rename"
 
         def _decision(accepted: bool):
+            policy = _selected_policy()
+            if accepted and policy == "cancel":
+                accepted = False
+                reason = "file_exists_cancelled"
+            else:
+                reason = "accepted" if accepted else "rejected"
             target = approval_dir / (f"{conn_id}.accept" if accepted else f"{conn_id}.reject")
             try:
-                target.write_text("accepted" if accepted else "rejected", encoding="utf-8")
+                payload = {"accepted": bool(accepted), "reason": reason, "file_policy": policy}
+                target.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
                 try:
                     request_path.unlink()
                 except Exception:
@@ -1125,6 +1352,12 @@ class RUDPTransferRoot(BoxLayout):
         self.sender_log_box.append(f"Process exited, rc={rc}\n")
         if int(rc or 0) == 0:
             self.sender_log_box.append(self.t("transfer_finished") + "\n")
+            self.retry_send_btn.disabled = True
+        else:
+            if not self.last_sender_failure_code:
+                self._display_user_error("transfer_failed", "", target="sender")
+            else:
+                self.retry_send_btn.disabled = False
 
     def receiver_exit(self, rc) -> None:
         self.receiver_log_box.append(f"Process exited, rc={rc}\n")

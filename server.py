@@ -36,12 +36,20 @@ from file_transfer_common import (
     DISCOVERY_MAGIC,
     EOF_PAYLOAD,
     build_discovery_response,
+    allocate_output_path,
     build_transfer_decision,
     build_transfer_request_log,
     build_transfer_request_obj,
+    build_user_error,
+    output_conflict_info,
     parse_file_header,
     print_local_ip_candidates,
+    probe_save_directory,
     unique_path,
+    resume_candidate_info,
+    write_resume_meta,
+    remove_resume_meta,
+    sha256_file,
 )
 from protocol import ReliableUDPSession, SYN_PAYLOAD_TAG
 from utils import FLAG_SYN, Packet, setup_logger
@@ -135,6 +143,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--disable-discovery", action="store_true", help="Disable LAN broadcast discovery response")
     p.add_argument("--receiver-name", default="", help="Friendly name shown during LAN discovery")
     p.add_argument("--once", action="store_true", help="Stop receiver after one completed or failed transfer")
+    p.add_argument("--keep-part-on-failure", action="store_true", default=True, help="Keep incomplete .part files for resume support")
     p.add_argument("--verbose-protocol", action="store_true", help="Show high-volume internal ACK logs")
     return p
 
@@ -348,7 +357,7 @@ class RUDPFileReceiver:
                 self.logger.error(f"listener error: {exc}")
                 time.sleep(0.05)
 
-    def _wait_gui_approval(self, conn_id: int, peer_addr, meta: Dict[str, object], out_path: Path) -> Tuple[bool, str]:
+    def _wait_gui_approval(self, conn_id: int, peer_addr, meta: Dict[str, object], suggested_path: Path, conflict: Dict[str, object]) -> Tuple[bool, str, Dict[str, object]]:
         approval_dir = str(getattr(self.args, "approval_dir", "") or "").strip()
         if not approval_dir:
             approval_dir = str(Path(self.args.save_dir).resolve())
@@ -363,7 +372,22 @@ class RUDPFileReceiver:
             except Exception:
                 pass
 
-        req_obj = build_transfer_request_obj(int(conn_id), peer_addr, meta, out_path)
+        req_obj = build_transfer_request_obj(
+            int(conn_id),
+            peer_addr,
+            meta,
+            suggested_path,
+            original_path=str(conflict.get("original_path") or suggested_path),
+            part_path=str(conflict.get("part_path") or (str(suggested_path) + ".part")),
+            file_exists=bool(conflict.get("file_exists")),
+            part_exists=bool(conflict.get("part_exists")),
+            conflict=bool(conflict.get("conflict")),
+            resume_available=bool(conflict.get("resume_available")),
+            resume_offset=int(conflict.get("resume_offset") or 0),
+            resume_pct=float(conflict.get("resume_pct") or 0.0),
+            resume_reason=str(conflict.get("resume_reason") or conflict.get("reason") or ""),
+            default_file_policy="resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite"),
+        )
         request_path = adir / f"{int(conn_id)}.request.json"
         try:
             tmp = request_path.with_suffix(request_path.suffix + ".tmp")
@@ -371,12 +395,37 @@ class RUDPFileReceiver:
             os.replace(tmp, request_path)
         except Exception as exc:
             self.logger.warning(f"Session {conn_id}: failed to write approval request file: {exc}")
-        self.logger.info(build_transfer_request_log(int(conn_id), peer_addr, meta, out_path))
+        self.logger.info(build_transfer_request_log(
+            int(conn_id),
+            peer_addr,
+            meta,
+            suggested_path,
+            original_path=req_obj.get("original_path"),
+            part_path=req_obj.get("part_path"),
+            file_exists=req_obj.get("file_exists"),
+            part_exists=req_obj.get("part_exists"),
+            conflict=req_obj.get("conflict"),
+            resume_available=req_obj.get("resume_available"),
+            resume_offset=req_obj.get("resume_offset"),
+            resume_pct=req_obj.get("resume_pct"),
+            default_file_policy=req_obj.get("default_file_policy"),
+        ))
         self.logger.info(f"Session {conn_id}: waiting for receiver approval")
         deadline = time.time() + max(1.0, float(getattr(self.args, "approval_timeout", 300.0) or 300.0))
         while self.running and time.time() < deadline:
             if accept_path.exists():
+                decision = {"file_policy": str(req_obj.get("default_file_policy") or "overwrite")}
                 try:
+                    txt = accept_path.read_text(encoding="utf-8", errors="ignore").strip()
+                    if txt:
+                        try:
+                            obj = json.loads(txt)
+                            if isinstance(obj, dict):
+                                decision.update(obj)
+                            else:
+                                decision["note"] = txt[:200]
+                        except Exception:
+                            decision["note"] = txt[:200]
                     accept_path.unlink()
                 except Exception:
                     pass
@@ -384,13 +433,22 @@ class RUDPFileReceiver:
                     request_path.unlink()
                 except Exception:
                     pass
-                return True, "accepted"
+                return True, "accepted", decision
             if reject_path.exists():
                 reason = "rejected"
+                decision = {}
                 try:
                     txt = reject_path.read_text(encoding="utf-8", errors="ignore").strip()
                     if txt:
-                        reason = txt[:200]
+                        try:
+                            obj = json.loads(txt)
+                            if isinstance(obj, dict):
+                                decision.update(obj)
+                                reason = str(obj.get("reason") or obj.get("code") or reason)
+                            else:
+                                reason = txt[:200]
+                        except Exception:
+                            reason = txt[:200]
                     reject_path.unlink()
                 except Exception:
                     pass
@@ -398,28 +456,47 @@ class RUDPFileReceiver:
                     request_path.unlink()
                 except Exception:
                     pass
-                return False, reason
+                return False, reason, decision
             time.sleep(0.1)
         try:
             request_path.unlink()
         except Exception:
             pass
-        return False, "approval_timeout"
+        return False, "approval_timeout", {}
 
-    def _ask_accept(self, conn_id: int, peer_addr, meta: Dict[str, object], out_path: Path) -> Tuple[bool, str]:
+    def _ask_accept(self, conn_id: int, peer_addr, meta: Dict[str, object], suggested_path: Path, conflict: Dict[str, object]) -> Tuple[bool, str, Dict[str, object]]:
         if bool(getattr(self.args, "require_approval", False)):
-            return self._wait_gui_approval(int(conn_id), peer_addr, meta, out_path)
+            return self._wait_gui_approval(int(conn_id), peer_addr, meta, suggested_path, conflict)
         if not bool(self.args.ask):
-            return True, "accepted"
+            # Console-less/default mode: keep backward-compatible behavior. If a
+            # conflict exists, choose a unique name rather than overwriting.
+            return True, "accepted", {"file_policy": "resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite")}
         print("\nIncoming file-transfer request")
         print(f"Sender: {peer_addr[0]}:{peer_addr[1]}")
         print(f"File name: {meta.get('name')}")
         print(f"Size: {meta.get('size')} bytes")
         print(f"SHA256: {meta.get('sha256')}")
-        print(f"Save path: {out_path}")
+        print(f"Suggested save path: {suggested_path}")
+        policy = "resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite")
+        if bool(conflict.get("resume_available")):
+            print(f"Resume candidate found: offset={int(conflict.get('resume_offset') or 0)} bytes ({float(conflict.get('resume_pct') or 0.0):.2f}%).")
+            ans_policy = input("Choose policy: [r]esume/[o]verwrite/[c]ancel? ").strip().lower()
+            if ans_policy in ("o", "overwrite"):
+                policy = "overwrite"
+            elif ans_policy in ("c", "cancel", "n", "no"):
+                return False, "file_exists_cancelled", {"file_policy": "cancel"}
+            else:
+                policy = "resume"
+        elif bool(conflict.get("conflict")):
+            print("Target file or .part file already exists.")
+            ans_policy = input("Choose policy: [r]ename/[o]verwrite/[c]ancel? ").strip().lower()
+            if ans_policy in ("o", "overwrite"):
+                policy = "overwrite"
+            elif ans_policy in ("c", "cancel", "n", "no"):
+                return False, "file_exists_cancelled", {"file_policy": "cancel"}
         ans = input("Accept this file? [y/N] ").strip().lower()
         ok = ans in ("y", "yes")
-        return ok, ("accepted" if ok else "rejected")
+        return ok, ("accepted" if ok else "rejected"), {"file_policy": policy}
 
     def _app_handler(self, session: ReliableUDPSession) -> None:
         cid = int(session.conn_id)
@@ -437,6 +514,8 @@ class RUDPFileReceiver:
         start_ts = time.time()
         last_report_ts = start_ts
         last_report_bytes = 0
+        last_meta_update_ts = start_ts
+        last_meta_update_bytes = 0
         exit_reason = "unknown"
 
         try:
@@ -473,11 +552,59 @@ class RUDPFileReceiver:
                         break
                     meta = parse_file_header(data)
                     expected_total = int(meta["size"])
-                    out_path = unique_path(str(self.args.save_dir), str(meta["name"]))
-                    part_path = Path(str(out_path) + ".part")
-                    accepted, decision_reason = self._ask_accept(cid, peer_addr, meta, out_path)
+
+                    save_check = probe_save_directory(str(self.args.save_dir), required_bytes=expected_total)
+                    if not bool(save_check.get("ok")):
+                        exit_reason = str(save_check.get("code") or "save_dir_error")
+                        detail = str(save_check.get("detail") or "")
+                        self.logger.error(build_user_error(exit_reason, "Receiver cannot save the incoming file", detail))
+                        try:
+                            session.send_app_data(1, build_transfer_decision(False, exit_reason, cid, detail=detail))
+                        except Exception as exc:
+                            self.logger.warning(f"Session {cid}: failed to send transfer decision: {exc}")
+                        time.sleep(0.2)
+                        session.abort(exit_reason)
+                        break
+
+                    conflict = output_conflict_info(str(self.args.save_dir), str(meta["name"]))
+                    resume_info = resume_candidate_info(str(self.args.save_dir), meta)
+                    conflict.update({
+                        "resume_available": bool(resume_info.get("resume_available")),
+                        "resume_offset": int(resume_info.get("resume_offset") or 0),
+                        "resume_pct": float(resume_info.get("resume_pct") or 0.0),
+                        "resume_reason": str(resume_info.get("reason") or ""),
+                    })
+                    if bool(conflict.get("resume_available")):
+                        suggested_path = Path(str(resume_info.get("out_path")))
+                    else:
+                        suggested_path = allocate_output_path(str(self.args.save_dir), str(meta["name"]), policy="rename" if bool(conflict.get("conflict")) else "overwrite")
+
+                    accepted, decision_reason, decision = self._ask_accept(cid, peer_addr, meta, suggested_path, conflict)
+                    policy = str((decision or {}).get("file_policy") or ("resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite"))).strip().lower()
+                    if policy not in ("resume", "rename", "overwrite"):
+                        policy = "rename" if bool(conflict.get("conflict")) else "overwrite"
+
+                    resume_offset = 0
+                    if policy == "resume" and bool(conflict.get("resume_available")):
+                        out_path = Path(str(resume_info.get("out_path")))
+                        part_path = Path(str(resume_info.get("part_path")))
+                        resume_offset = int(resume_info.get("resume_offset") or 0)
+                        payload = max(1, int(meta.get("payload_size") or 1))
+                        resume_offset -= resume_offset % payload
+                        if resume_offset <= 0 or resume_offset >= int(expected_total or 0):
+                            policy = "overwrite"
+                            resume_offset = 0
+                    if policy != "resume":
+                        out_path = allocate_output_path(str(self.args.save_dir), str(meta["name"]), policy=policy)
+                        part_path = Path(str(out_path) + ".part")
+
+                    resume_pct = (resume_offset * 100.0 / max(int(expected_total or 0), 1)) if resume_offset > 0 else 0.0
                     try:
-                        session.send_app_data(1, build_transfer_decision(bool(accepted), str(decision_reason), cid))
+                        session.send_app_data(1, build_transfer_decision(
+                            bool(accepted), str(decision_reason), cid,
+                            file_policy=policy, resume=(policy == "resume" and resume_offset > 0),
+                            resume_offset=int(resume_offset), resume_pct=float(resume_pct),
+                        ))
                     except Exception as exc:
                         self.logger.warning(f"Session {cid}: failed to send transfer decision: {exc}")
                     if not accepted:
@@ -485,11 +612,48 @@ class RUDPFileReceiver:
                         time.sleep(0.2)
                         session.abort(exit_reason)
                         break
-                    out_f = open(part_path, "wb")
+
+                    try:
+                        if policy == "resume" and resume_offset > 0 and part_path is not None:
+                            with open(part_path, "r+b") as fp:
+                                fp.truncate(int(resume_offset))
+                            out_f = open(part_path, "ab")
+                            bytes_recv = int(resume_offset)
+                            last_report_bytes = int(resume_offset)
+                            self.logger.info(
+                                f"Session {cid}: resume accepted; offset={resume_offset}/{expected_total} bytes "
+                                f"({resume_pct:.2f}%) -> {out_path}"
+                            )
+                        else:
+                            try:
+                                if part_path is not None and part_path.exists():
+                                    part_path.unlink()
+                                    remove_resume_meta(part_path)
+                            except Exception:
+                                pass
+                            out_f = open(part_path, "wb")
+                            bytes_recv = 0
+                            last_report_bytes = 0
+                    except Exception as exc:
+                        exit_reason = "output_open_failed"
+                        detail = str(exc)
+                        self.logger.error(build_user_error(exit_reason, "Receiver failed to open output file", detail))
+                        try:
+                            session.send_app_data(1, build_transfer_decision(False, exit_reason, cid, detail=detail))
+                        except Exception:
+                            pass
+                        session.abort(exit_reason)
+                        break
+
+                    try:
+                        if part_path is not None and out_path is not None:
+                            write_resume_meta(part_path, meta, out_path, int(bytes_recv))
+                    except Exception as exc:
+                        self.logger.warning(f"Session {cid}: failed to write resume meta: {exc}")
                     header_seen = True
                     self.logger.info(
                         f"Session {cid}: transfer accepted; receiving {meta['name']} from {peer_addr}, "
-                        f"size={expected_total} bytes -> {out_path}"
+                        f"size={expected_total} bytes -> {out_path}, policy={policy}, resume_offset={resume_offset}"
                     )
                     continue
 
@@ -512,6 +676,14 @@ class RUDPFileReceiver:
                 bytes_recv += len(data)
                 pkts_recv += 1
 
+                if part_path is not None and out_path is not None and (bytes_recv - last_meta_update_bytes >= 4 * 1024 * 1024 or now - last_meta_update_ts >= 1.0):
+                    try:
+                        write_resume_meta(part_path, meta or {}, out_path, int(bytes_recv))
+                        last_meta_update_bytes = int(bytes_recv)
+                        last_meta_update_ts = now
+                    except Exception as exc:
+                        self.logger.warning(f"Session {cid}: failed to update resume meta: {exc}")
+
                 if now - last_report_ts >= float(self.args.stats_interval):
                     elapsed = max(now - start_ts, 1e-6)
                     interval = max(now - last_report_ts, 1e-6)
@@ -530,7 +702,13 @@ class RUDPFileReceiver:
                     last_report_bytes = bytes_recv
 
             if eof_seen and header_seen and meta is not None and expected_total is not None:
-                received_sha = sha.hexdigest()
+                if part_path is not None and part_path.exists():
+                    try:
+                        received_sha = sha256_file(str(part_path))
+                    except Exception:
+                        received_sha = sha.hexdigest()
+                else:
+                    received_sha = sha.hexdigest()
                 expected_sha = str(meta.get("sha256") or "").lower()
                 if bytes_recv != expected_total:
                     exit_reason = "size_mismatch"
@@ -543,6 +721,7 @@ class RUDPFileReceiver:
                 else:
                     if part_path is not None and out_path is not None:
                         os.replace(part_path, out_path)
+                        remove_resume_meta(part_path)
                     complete_res = session.send_complete_commit(int(expected_total), int(bytes_recv))
                     if not bool((complete_res or {}).get("ok")):
                         exit_reason = f"complete_commit_failed:{(complete_res or {}).get('status')}"
@@ -574,10 +753,11 @@ class RUDPFileReceiver:
                     pass
             if exit_reason != "complete" and part_path is not None:
                 try:
-                    if part_path.exists():
-                        part_path.unlink()
-                except Exception:
-                    pass
+                    if out_path is not None and part_path.exists() and meta is not None:
+                        write_resume_meta(part_path, meta, out_path, int(bytes_recv))
+                        self.logger.info(f"Session {cid}: kept partial file for resume: {part_path}, bytes={bytes_recv}")
+                except Exception as exc:
+                    self.logger.warning(f"Session {cid}: failed to preserve resume meta: {exc}")
             self.logger.info(f"Session {cid}: end reason={exit_reason}, bytes_recv={bytes_recv}")
             # A short linger keeps the receiver alive for duplicate EOF/COMPLETE_ACK traffic.
             if exit_reason == "complete":

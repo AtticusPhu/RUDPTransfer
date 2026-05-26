@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-APP_HEADER_VERSION = 1
+APP_HEADER_VERSION = 2
+APP_HEADER_COMPAT_VERSIONS = {1, 2}
 APP_HEADER_TYPE_FILE = "FILE"
 EOF_PAYLOAD = b"__RUDP_FILE_EOF__"
 SEQ_HEADER = 1
@@ -27,7 +28,20 @@ DISCOVERY_RESPONSE_MAGIC = "RUDP_RECEIVER_V1"
 DEFAULT_DISCOVERY_PORT = 9998
 TRANSFER_DECISION_MAGIC = "RUDP_TRANSFER_DECISION_V1"
 TRANSFER_REQUEST_LOG_PREFIX = "TRANSFER_REQUEST_JSON:"
+USER_ERROR_LOG_PREFIX = "USER_ERROR_JSON:"
+USER_STATUS_LOG_PREFIX = "USER_STATUS_JSON:"
 
+
+
+def build_user_error(code: str, message: str = "", detail: str = "") -> str:
+    obj = {"code": str(code or "unknown_error"), "message": str(message or ""), "detail": str(detail or ""), "ts": time.time()}
+    return USER_ERROR_LOG_PREFIX + json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_user_status(code: str, message: str = "", **extra) -> str:
+    obj = {"code": str(code or "status"), "message": str(message or ""), "ts": time.time()}
+    obj.update(extra)
+    return USER_STATUS_LOG_PREFIX + json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
 def sha256_file(path: str, block_size: int = 1024 * 1024) -> str:
@@ -437,15 +451,18 @@ def discover_receivers(
     return results
 
 
-def build_transfer_decision(accepted: bool, reason: str = "", conn_id: int = 0) -> bytes:
+def build_transfer_decision(accepted: bool, reason: str = "", conn_id: int = 0, **extra) -> bytes:
     obj = {
         "magic": TRANSFER_DECISION_MAGIC,
-        "version": 1,
+        "version": 2,
         "accepted": bool(accepted),
         "reason": str(reason or ""),
         "conn_id": int(conn_id or 0),
         "ts": time.time(),
     }
+    for key, value in (extra or {}).items():
+        if key not in obj:
+            obj[str(key)] = value
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -459,8 +476,8 @@ def parse_transfer_decision(data: bytes) -> Dict[str, object]:
     return obj
 
 
-def build_transfer_request_obj(conn_id: int, peer_addr, meta: Dict[str, object], out_path: Path) -> Dict[str, object]:
-    return {
+def build_transfer_request_obj(conn_id: int, peer_addr, meta: Dict[str, object], out_path: Path, **extra) -> Dict[str, object]:
+    obj = {
         "conn_id": int(conn_id),
         "sender": f"{peer_addr[0]}:{peer_addr[1]}",
         "sender_ip": str(peer_addr[0]),
@@ -471,10 +488,12 @@ def build_transfer_request_obj(conn_id: int, peer_addr, meta: Dict[str, object],
         "save_path": str(out_path),
         "ts": time.time(),
     }
+    obj.update(extra or {})
+    return obj
 
 
-def build_transfer_request_log(conn_id: int, peer_addr, meta: Dict[str, object], out_path: Path) -> str:
-    obj = build_transfer_request_obj(conn_id, peer_addr, meta, out_path)
+def build_transfer_request_log(conn_id: int, peer_addr, meta: Dict[str, object], out_path: Path, **extra) -> str:
+    obj = build_transfer_request_obj(conn_id, peer_addr, meta, out_path, **extra)
     return TRANSFER_REQUEST_LOG_PREFIX + json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -506,6 +525,211 @@ def unique_path(directory: str, filename: str) -> Path:
     raise RuntimeError("cannot allocate unique output filename")
 
 
+
+
+def allocate_output_path(directory: str, filename: str, policy: str = "rename") -> Path:
+    """Return final output path for a received file.
+
+    policy values:
+    - rename: choose a unique path without replacing existing files;
+    - overwrite: use the original safe filename and replace it only after the
+      .part file has been fully received and verified.
+    """
+    base_dir = Path(directory).expanduser().resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
+    safe = safe_filename(filename)
+    original = base_dir / safe
+    policy = str(policy or "rename").strip().lower()
+    if policy == "overwrite":
+        return original
+    return unique_path(str(base_dir), safe)
+
+
+def probe_save_directory(directory: str, required_bytes: int = 0, reserve_bytes: int = 100 * 1024 * 1024) -> Dict[str, object]:
+    """Check whether a receive directory is usable before accepting a file."""
+    base_dir = Path(directory).expanduser().resolve()
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return {"ok": False, "code": "save_dir_create_failed", "detail": str(exc), "path": str(base_dir)}
+    if not base_dir.is_dir():
+        return {"ok": False, "code": "save_dir_not_directory", "detail": str(base_dir), "path": str(base_dir)}
+    try:
+        test_path = base_dir / ".rudp_write_test.tmp"
+        with open(test_path, "wb") as f:
+            f.write(b"ok")
+        try:
+            test_path.unlink()
+        except Exception:
+            pass
+    except Exception as exc:
+        return {"ok": False, "code": "save_dir_not_writable", "detail": str(exc), "path": str(base_dir)}
+    try:
+        import shutil
+        usage = shutil.disk_usage(str(base_dir))
+        need = max(0, int(required_bytes or 0)) + max(0, int(reserve_bytes or 0))
+        if int(usage.free) < need:
+            return {
+                "ok": False,
+                "code": "disk_space_not_enough",
+                "detail": f"free={int(usage.free)} required={need}",
+                "path": str(base_dir),
+                "free_bytes": int(usage.free),
+                "required_bytes": int(need),
+            }
+    except Exception:
+        # If the OS cannot report disk usage, do not block the transfer.
+        pass
+    return {"ok": True, "code": "ok", "path": str(base_dir)}
+
+
+def output_conflict_info(directory: str, filename: str) -> Dict[str, object]:
+    base_dir = Path(directory).expanduser().resolve()
+    safe = safe_filename(filename)
+    original = base_dir / safe
+    part = Path(str(original) + ".part")
+    exists = original.exists()
+    part_exists = part.exists()
+    return {
+        "original_path": str(original),
+        "part_path": str(part),
+        "file_exists": bool(exists),
+        "part_exists": bool(part_exists),
+        "conflict": bool(exists or part_exists),
+    }
+
+
+
+
+def make_transfer_id(meta_or_sha256: Dict[str, object] | str) -> str:
+    """Return a stable file-transfer id.
+
+    For v2, the full-file SHA256 is used as the transfer id. This keeps resume
+    negotiation simple: only a partial file with the same final SHA256 can be
+    resumed.
+    """
+    if isinstance(meta_or_sha256, dict):
+        value = str(meta_or_sha256.get("transfer_id") or meta_or_sha256.get("sha256") or "").strip().lower()
+    else:
+        value = str(meta_or_sha256 or "").strip().lower()
+    return value
+
+
+def resume_meta_path(part_path: Path | str) -> Path:
+    return Path(str(part_path) + ".meta.json")
+
+
+def read_resume_meta(part_path: Path | str) -> Dict[str, object]:
+    meta_path = resume_meta_path(part_path)
+    try:
+        obj = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def write_resume_meta(part_path: Path | str, meta: Dict[str, object], out_path: Path | str, received_bytes: int) -> None:
+    part = Path(part_path)
+    meta_path = resume_meta_path(part)
+    obj = {
+        "version": 2,
+        "transfer_id": make_transfer_id(meta),
+        "name": str(meta.get("name") or ""),
+        "size": int(meta.get("size") or 0),
+        "sha256": str(meta.get("sha256") or "").strip().lower(),
+        "payload_size": int(meta.get("payload_size") or 0),
+        "received_bytes": int(max(0, int(received_bytes or 0))),
+        "out_path": str(out_path),
+        "part_path": str(part),
+        "updated_at": time.time(),
+    }
+    tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, meta_path)
+
+
+def remove_resume_meta(part_path: Path | str) -> None:
+    try:
+        resume_meta_path(part_path).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def resume_candidate_info(directory: str, meta: Dict[str, object]) -> Dict[str, object]:
+    """Inspect whether an existing .part file can be resumed.
+
+    The current implementation uses implicit file offsets: the sender starts at
+    `resume_offset`, while the receiver appends to the existing .part file.
+    The offset is aligned down to payload_size to avoid partial-chunk ambiguity.
+    """
+    base_dir = Path(directory).expanduser().resolve()
+    safe = safe_filename(str(meta.get("name") or "received.bin"))
+    out_path = base_dir / safe
+    part_path = Path(str(out_path) + ".part")
+    info: Dict[str, object] = {
+        "resume_available": False,
+        "resume_offset": 0,
+        "resume_pct": 0.0,
+        "out_path": str(out_path),
+        "part_path": str(part_path),
+        "meta_path": str(resume_meta_path(part_path)),
+        "reason": "not_available",
+    }
+    if not part_path.exists() or not part_path.is_file():
+        info["reason"] = "part_missing"
+        return info
+    saved = read_resume_meta(part_path)
+    if not saved:
+        info["reason"] = "meta_missing"
+        return info
+    expected_transfer_id = make_transfer_id(meta)
+    saved_transfer_id = make_transfer_id(saved)
+    if expected_transfer_id and saved_transfer_id != expected_transfer_id:
+        info["reason"] = "transfer_id_mismatch"
+        return info
+    for key in ("size", "payload_size"):
+        try:
+            if int(saved.get(key) or 0) != int(meta.get(key) or 0):
+                info["reason"] = f"{key}_mismatch"
+                return info
+        except Exception:
+            info["reason"] = f"{key}_invalid"
+            return info
+    if str(saved.get("sha256") or "").strip().lower() != str(meta.get("sha256") or "").strip().lower():
+        info["reason"] = "sha256_mismatch"
+        return info
+    try:
+        actual_size = int(part_path.stat().st_size)
+    except Exception:
+        info["reason"] = "part_stat_failed"
+        return info
+    total = int(meta.get("size") or 0)
+    payload_size = max(1, int(meta.get("payload_size") or 1))
+    saved_bytes = int(saved.get("received_bytes") or 0)
+    offset = min(actual_size, saved_bytes, total)
+    if offset <= 0:
+        info["reason"] = "empty_part"
+        return info
+    if offset >= total:
+        # A full .part exists but has not been finalized. Re-verify by receiving
+        # zero bytes is not supported in the first resume version; restart or
+        # overwrite is safer.
+        offset = total
+    aligned = offset - (offset % payload_size)
+    if aligned <= 0 and offset > 0:
+        aligned = 0
+    info.update({
+        "resume_available": bool(aligned > 0 and aligned < total),
+        "resume_offset": int(aligned),
+        "resume_pct": (float(aligned) * 100.0 / float(total)) if total > 0 else 0.0,
+        "actual_part_size": actual_size,
+        "meta_received_bytes": saved_bytes,
+        "reason": "ok" if aligned > 0 and aligned < total else "not_resumable_size",
+    })
+    return info
+
 def build_file_header(path: str, payload_size: int, sha256_hex: Optional[str] = None) -> bytes:
     p = Path(path)
     if not p.is_file():
@@ -516,10 +740,13 @@ def build_file_header(path: str, payload_size: int, sha256_hex: Optional[str] = 
     obj: Dict[str, object] = {
         "type": APP_HEADER_TYPE_FILE,
         "version": APP_HEADER_VERSION,
+        "transfer_id": make_transfer_id(str(sha256_hex)),
         "name": p.name,
         "size": int(size),
         "payload_size": int(payload_size),
         "sha256": str(sha256_hex),
+        "resume_supported": True,
+        "mtime_ns": int(p.stat().st_mtime_ns),
     }
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -534,7 +761,8 @@ def parse_file_header(data: bytes) -> Dict[str, object]:
 
     if obj.get("type") != APP_HEADER_TYPE_FILE:
         raise ValueError("unsupported_header_type")
-    if int(obj.get("version", 0)) != APP_HEADER_VERSION:
+    version = int(obj.get("version", 0))
+    if version not in APP_HEADER_COMPAT_VERSIONS:
         raise ValueError("unsupported_header_version")
 
     name = safe_filename(str(obj.get("name") or "received.bin"))
@@ -551,9 +779,12 @@ def parse_file_header(data: bytes) -> Dict[str, object]:
 
     return {
         "type": APP_HEADER_TYPE_FILE,
-        "version": APP_HEADER_VERSION,
+        "version": version,
+        "transfer_id": make_transfer_id(str(obj.get("transfer_id") or sha256_hex)),
         "name": name,
         "size": size,
         "payload_size": payload_size,
         "sha256": sha256_hex,
+        "resume_supported": bool(obj.get("resume_supported", version >= 2)),
+        "mtime_ns": int(obj.get("mtime_ns") or 0),
     }
