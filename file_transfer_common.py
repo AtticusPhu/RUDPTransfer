@@ -8,20 +8,65 @@ import ipaddress
 import json
 import os
 import socket
+import shutil
 import subprocess
+import secrets
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 APP_HEADER_VERSION = 2
 APP_HEADER_COMPAT_VERSIONS = {1, 2}
 APP_HEADER_TYPE_FILE = "FILE"
+FILE_OFFER_TYPE = "FILE_OFFER"
+FILE_OFFER_ACCEPT_TYPE = "FILE_OFFER_ACCEPT"
+FILE_OFFER_VERSION = 1
 EOF_PAYLOAD = b"__RUDP_FILE_EOF__"
 SEQ_HEADER = 1
 SEQ_FIRST_BODY = 2
 DATA_SEQ_UPPER_EXCLUSIVE = 1 << 63
 MAX_DATA_SEQ = DATA_SEQ_UPPER_EXCLUSIVE - 1
+STORAGE_WARNING_RESERVE_BYTES = 5 * 1024 * 1024 * 1024
+LARGE_FILE_THRESHOLD_BYTES = 128 * 1024 * 1024
+TRANSFER_MODE_SMALL_SEQUENTIAL = "small_sequential"
+TRANSFER_MODE_LARGE_RANGE = "large_range"
+
+FILE_TRANSFER_STATUS_PENDING = "pending"
+FILE_TRANSFER_STATUS_ACTIVE = "active"
+FILE_TRANSFER_STATUS_COMPLETED = "completed"
+FILE_TRANSFER_STATUS_FAILED = "failed"
+FILE_TRANSFER_STATUS_CANCELLED = "cancelled"
+FILE_TRANSFER_STATUS_PAUSED = "paused"
+
+BATCH_TRANSFER_STATUS_PENDING = "pending"
+BATCH_TRANSFER_STATUS_ACTIVE = "active"
+BATCH_TRANSFER_STATUS_COMPLETED = "completed"
+BATCH_TRANSFER_STATUS_FAILED = "failed"
+BATCH_TRANSFER_STATUS_CANCELLED = "cancelled"
+
+MAX_FILE_TRANSFER_TASKS = 20
+DEFAULT_MAX_ACTIVE_FILE_TRANSFERS = 20
+FILE_TRANSFER_BASE_QUANTUM_BYTES = 256 * 1024
+FILE_TRANSFER_SMALL_WEIGHT = 4.0
+FILE_TRANSFER_MEDIUM_WEIGHT = 2.0
+FILE_TRANSFER_LARGE_WEIGHT = 1.0
+FILE_TRANSFER_SMALL_SLICE_BYTES = 512 * 1024
+FILE_TRANSFER_LARGE_SLICE_BYTES = 2 * 1024 * 1024
+
+# Single-file range scheduler policy. Stable paths prefer larger sequential
+# slices; unstable paths bias toward small holes so resume/repair can converge
+# sooner and metadata remains useful after interruption.
+RANGE_SCHEDULER_MODE_STABLE = "stable"
+RANGE_SCHEDULER_MODE_UNSTABLE = "unstable"
+RANGE_SCHEDULER_STABLE_SLICE_BYTES = 4 * 1024 * 1024
+RANGE_SCHEDULER_UNSTABLE_SLICE_BYTES = 1 * 1024 * 1024
+RANGE_SCHEDULER_NEAR_COMPLETE_RATIO = 0.90
+RANGE_SCHEDULER_NEAR_COMPLETE_REMAINING_BYTES = 512 * 1024 * 1024
+
+FILE_BODY_OFFSET_MAGIC = b"RFB1"
+FILE_BODY_OFFSET_HEADER_LEN = len(FILE_BODY_OFFSET_MAGIC) + 8
 
 DISCOVERY_MAGIC = "RUDP_DISCOVER_V1"
 DISCOVERY_RESPONSE_MAGIC = "RUDP_RECEIVER_V1"
@@ -53,6 +98,1002 @@ def sha256_file(path: str, block_size: int = 1024 * 1024) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def storage_space_warning_info(directory: str, file_size: int, reserve_bytes: int = STORAGE_WARNING_RESERVE_BYTES) -> Dict[str, object]:
+    """Return a non-blocking disk-space warning for receiver approval UI.
+
+    The warning threshold follows the current product rule: warn when available
+    space is smaller than incoming file size plus a 5 GiB safety reserve. This
+    function never rejects a transfer by itself; it only reports warning fields.
+    """
+    base_dir = Path(directory).expanduser().resolve()
+    file_size = max(0, int(file_size or 0))
+    reserve_bytes = max(0, int(reserve_bytes or 0))
+    threshold = file_size + reserve_bytes
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(str(base_dir))
+        free = int(usage.free)
+        return {
+            "storage_warning": bool(free < threshold),
+            "storage_free_bytes": free,
+            "storage_file_bytes": file_size,
+            "storage_reserve_bytes": reserve_bytes,
+            "storage_threshold_bytes": threshold,
+            "storage_warning_detail": f"free={free} threshold={threshold} file_size={file_size} reserve={reserve_bytes}",
+        }
+    except Exception as exc:
+        return {
+            "storage_warning": False,
+            "storage_space_unknown": True,
+            "storage_warning_detail": str(exc),
+            "storage_free_bytes": 0,
+            "storage_file_bytes": file_size,
+            "storage_reserve_bytes": reserve_bytes,
+            "storage_threshold_bytes": threshold,
+        }
+
+
+def logical_preallocate_file(path: Path | str, size: int) -> None:
+    """Create or resize a .part file to its final logical size.
+
+    This is the downloader-style logical preallocation used by the receiver.
+    It does not write zeroes across the whole file, so on sparse-capable file
+    systems it is fast and may not immediately consume the full logical size.
+    Valid received progress must therefore be read from resume metadata, not
+    from the .part file length.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    size = max(0, int(size or 0))
+    mode = "r+b" if p.exists() else "w+b"
+    with open(p, mode) as f:
+        f.truncate(size)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+
+
+def choose_transfer_mode(file_size: int) -> str:
+    """Use a two-tier policy: <128 MiB small, >=128 MiB large-range."""
+    return TRANSFER_MODE_LARGE_RANGE if int(file_size or 0) >= LARGE_FILE_THRESHOLD_BYTES else TRANSFER_MODE_SMALL_SEQUENTIAL
+
+
+FILE_BODY_OFFSET_MAGIC_V2 = b"RFB2"
+
+
+def _safe_file_id_bytes(file_id: str) -> bytes:
+    raw = str(file_id or "").encode("utf-8")
+    if len(raw) > 255:
+        raw = raw[:255]
+    return raw
+
+
+def build_file_body_frame(offset: int, payload: bytes, file_id: str = "") -> bytes:
+    """Wrap a file BODY chunk with its absolute file offset.
+
+    V1 frame: RFB1 + 8B offset + payload.
+    V2 frame: RFB2 + 1B file_id_len + file_id + 8B offset + payload.
+    The optional file_id lets the same session route chunks for multiple
+    independent file tasks. Omitting file_id keeps single-file compatibility.
+    """
+    offset = int(offset or 0)
+    if offset < 0:
+        raise ValueError("negative_file_body_offset")
+    fid = _safe_file_id_bytes(file_id)
+    if fid:
+        return FILE_BODY_OFFSET_MAGIC_V2 + bytes([len(fid)]) + fid + offset.to_bytes(8, "big") + bytes(payload or b"")
+    return FILE_BODY_OFFSET_MAGIC + offset.to_bytes(8, "big") + bytes(payload or b"")
+
+
+def parse_file_body_frame_ex(data: bytes) -> Tuple[str, int, bytes]:
+    raw = bytes(data or b"")
+    if raw.startswith(FILE_BODY_OFFSET_MAGIC_V2):
+        if len(raw) < len(FILE_BODY_OFFSET_MAGIC_V2) + 1 + 8:
+            raise ValueError("invalid_file_body_offset_frame_v2")
+        pos = len(FILE_BODY_OFFSET_MAGIC_V2)
+        fid_len = int(raw[pos])
+        pos += 1
+        if len(raw) < pos + fid_len + 8:
+            raise ValueError("invalid_file_body_offset_frame_v2_length")
+        file_id = raw[pos:pos + fid_len].decode("utf-8", errors="replace")
+        pos += fid_len
+        offset = int.from_bytes(raw[pos:pos + 8], "big")
+        return file_id, offset, raw[pos + 8:]
+    if len(raw) < FILE_BODY_OFFSET_HEADER_LEN or raw[:len(FILE_BODY_OFFSET_MAGIC)] != FILE_BODY_OFFSET_MAGIC:
+        raise ValueError("invalid_file_body_offset_frame")
+    offset = int.from_bytes(raw[len(FILE_BODY_OFFSET_MAGIC):FILE_BODY_OFFSET_HEADER_LEN], "big")
+    return "", offset, raw[FILE_BODY_OFFSET_HEADER_LEN:]
+
+
+def parse_file_body_frame(data: bytes) -> Tuple[int, bytes]:
+    _file_id, offset, payload = parse_file_body_frame_ex(data)
+    return offset, payload
+
+
+def canonical_relative_path(path: str) -> str:
+    parts: List[str] = []
+    raw = str(path or "").replace("\\", "/")
+    for part in raw.split("/"):
+        part = part.strip()
+        if not part or part in (".", ".."): 
+            continue
+        # Keep this conservative because the value is used for identity and for
+        # receiver-side path construction elsewhere.
+        part = "".join("_" if ch in '<>:"\\|?*' else ch for ch in part)
+        if part:
+            parts.append(part)
+    return "/".join(parts) or "unnamed"
+
+
+def build_content_file_key(relative_path: str, size: int, sha256_hex: str) -> str:
+    obj = {
+        "relative_path": canonical_relative_path(relative_path),
+        "size": int(max(0, int(size or 0))),
+        "sha256": str(sha256_hex or "").strip().lower(),
+    }
+    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def build_receiver_file_key(peer_id: str, save_root: str, relative_path: str, size: int, sha256_hex: str) -> str:
+    obj = {
+        "peer_id": str(peer_id or ""),
+        "save_root": str(save_root or ""),
+        "relative_path": canonical_relative_path(relative_path),
+        "size": int(max(0, int(size or 0))),
+        "sha256": str(sha256_hex or "").strip().lower(),
+    }
+    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def make_runtime_file_id(file_key: str) -> str:
+    key = str(file_key or "").strip().lower()
+    return (key[:24] if key else secrets.token_hex(12))
+
+
+def build_file_offer_item(path: str, payload_size: int, sha256_hex: Optional[str] = None, relative_path: Optional[str] = None) -> Dict[str, object]:
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(str(path))
+    size = int(p.stat().st_size)
+    if sha256_hex is None:
+        sha256_hex = sha256_file(str(p))
+    sha256_hex = str(sha256_hex or "").strip().lower()
+    rel = canonical_relative_path(relative_path or p.name)
+    content_key = build_content_file_key(rel, size, sha256_hex)
+    file_id = make_runtime_file_id(content_key)
+    return {
+        "file_id": file_id,
+        "content_file_key": content_key,
+        "relative_path": rel,
+        "name": safe_filename(Path(rel).name or p.name),
+        "size": size,
+        "payload_size": int(payload_size),
+        "sha256": sha256_hex,
+        "transfer_id": make_transfer_id(sha256_hex),
+        "transfer_mode": choose_transfer_mode(size),
+        "large_file_threshold_bytes": LARGE_FILE_THRESHOLD_BYTES,
+        "resume_supported": True,
+        "range_resume_supported": True,
+        "mtime_ns": int(p.stat().st_mtime_ns),
+    }
+
+
+def build_file_offer(files: Iterable[Dict[str, object]], offer_id: Optional[str] = None) -> bytes:
+    file_list = []
+    total_size = 0
+    for item in files or []:
+        if not isinstance(item, dict):
+            continue
+        rel = canonical_relative_path(str(item.get("relative_path") or item.get("name") or "unnamed"))
+        size = int(item.get("size") or 0)
+        sha = str(item.get("sha256") or "").strip().lower()
+        content_key = str(item.get("content_file_key") or build_content_file_key(rel, size, sha))
+        file_id = str(item.get("file_id") or make_runtime_file_id(content_key))
+        obj = dict(item)
+        obj.update({
+            "file_id": file_id,
+            "content_file_key": content_key,
+            "relative_path": rel,
+            "name": safe_filename(str(item.get("name") or Path(rel).name or "received.bin")),
+            "size": size,
+            "sha256": sha,
+            "transfer_id": str(item.get("transfer_id") or make_transfer_id(sha)),
+            "transfer_mode": str(item.get("transfer_mode") or choose_transfer_mode(size)),
+            "payload_size": int(item.get("payload_size") or 0),
+        })
+        total_size += size
+        file_list.append(obj)
+    if not file_list:
+        raise ValueError("empty_file_offer")
+    oid = str(offer_id or ("offer_" + secrets.token_hex(12)))
+    payload = {
+        "type": FILE_OFFER_TYPE,
+        "version": FILE_OFFER_VERSION,
+        "offer_id": oid,
+        "total_files": len(file_list),
+        "total_size": int(total_size),
+        "files": file_list,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def parse_file_offer(data: bytes) -> Dict[str, object]:
+    try:
+        obj = json.loads(bytes(data or b"").decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("offer_not_valid_json") from exc
+    if not isinstance(obj, dict) or obj.get("type") != FILE_OFFER_TYPE:
+        raise ValueError("unsupported_offer_type")
+    version = int(obj.get("version") or 0)
+    if version != FILE_OFFER_VERSION:
+        raise ValueError("unsupported_offer_version")
+    files = obj.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("empty_offer_files")
+    clean_files = []
+    total_size = 0
+    for raw in files:
+        if not isinstance(raw, dict):
+            continue
+        rel = canonical_relative_path(str(raw.get("relative_path") or raw.get("name") or "unnamed"))
+        size = int(raw.get("size") or 0)
+        payload_size = int(raw.get("payload_size") or 0)
+        sha = str(raw.get("sha256") or "").strip().lower()
+        if size < 0 or payload_size <= 0:
+            raise ValueError("invalid_offer_file_size")
+        if sha and (len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha)):
+            raise ValueError("invalid_offer_file_sha256")
+        content_key = str(raw.get("content_file_key") or build_content_file_key(rel, size, sha))
+        file_id = str(raw.get("file_id") or make_runtime_file_id(content_key))
+        item = dict(raw)
+        item.update({
+            "file_id": file_id,
+            "content_file_key": content_key,
+            "relative_path": rel,
+            "name": safe_filename(str(raw.get("name") or Path(rel).name or "received.bin")),
+            "size": size,
+            "payload_size": payload_size,
+            "sha256": sha,
+            "transfer_id": str(raw.get("transfer_id") or make_transfer_id(sha)),
+            "transfer_mode": str(raw.get("transfer_mode") or choose_transfer_mode(size)),
+            "type": APP_HEADER_TYPE_FILE,
+            "version": APP_HEADER_VERSION,
+        })
+        total_size += size
+        clean_files.append(item)
+    if not clean_files:
+        raise ValueError("empty_offer_files")
+    obj["files"] = clean_files
+    obj["total_files"] = len(clean_files)
+    obj["total_size"] = int(total_size)
+    obj["offer_id"] = str(obj.get("offer_id") or ("offer_" + secrets.token_hex(12)))
+    return obj
+
+
+def build_file_offer_accept(offer_id: str, accepted: bool, accepted_files: Iterable[Dict[str, object]], reason: str = "", conn_id: int = 0, **extra) -> bytes:
+    obj = {
+        "type": FILE_OFFER_ACCEPT_TYPE,
+        "version": FILE_OFFER_VERSION,
+        "offer_id": str(offer_id or ""),
+        "accepted": bool(accepted),
+        "reason": str(reason or ("accepted" if accepted else "rejected")),
+        "conn_id": int(conn_id or 0),
+        "accepted_files": list(accepted_files or []),
+        "ts": time.time(),
+    }
+    obj.update(extra or {})
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def parse_file_offer_accept(data: bytes) -> Dict[str, object]:
+    try:
+        obj = json.loads(bytes(data or b"").decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("offer_accept_not_valid_json") from exc
+    if not isinstance(obj, dict) or obj.get("type") != FILE_OFFER_ACCEPT_TYPE:
+        raise ValueError("unsupported_offer_accept_type")
+    files = obj.get("accepted_files")
+    if not isinstance(files, list):
+        files = []
+    obj["accepted_files"] = [x for x in files if isinstance(x, dict)]
+    return obj
+
+
+def allocate_output_path_for_relative(directory: str, relative_path: str, policy: str = "rename") -> Path:
+    base_dir = Path(directory).expanduser().resolve()
+    rel = canonical_relative_path(relative_path)
+    parts = rel.split("/")
+    if not parts:
+        return allocate_output_path(str(base_dir), "received.bin", policy=policy)
+    subdir = base_dir.joinpath(*parts[:-1]) if len(parts) > 1 else base_dir
+    subdir.mkdir(parents=True, exist_ok=True)
+    return allocate_output_path(str(subdir), parts[-1], policy=policy)
+
+
+def output_conflict_info_for_relative(directory: str, relative_path: str) -> Dict[str, object]:
+    out = allocate_output_path_for_relative(directory, relative_path, policy="overwrite")
+    part = Path(str(out) + ".part")
+    return {
+        "original_path": str(out),
+        "part_path": str(part),
+        "file_exists": bool(out.exists()),
+        "part_exists": bool(part.exists()),
+        "conflict": bool(out.exists() or part.exists()),
+    }
+
+
+def normalize_ranges(ranges: Iterable[Iterable[int]], file_size: Optional[int] = None) -> List[List[int]]:
+    clean: List[Tuple[int, int]] = []
+    max_size = None if file_size is None else max(0, int(file_size))
+    for item in ranges or []:
+        try:
+            a, b = list(item)[:2]
+            start = max(0, int(a))
+            end = max(0, int(b))
+        except Exception:
+            continue
+        if max_size is not None:
+            start = min(start, max_size)
+            end = min(end, max_size)
+        if end <= start:
+            continue
+        clean.append((start, end))
+    clean.sort()
+    merged: List[List[int]] = []
+    for start, end in clean:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+    return merged
+
+
+def ranges_total_bytes(ranges: Iterable[Iterable[int]], file_size: Optional[int] = None) -> int:
+    return int(sum(end - start for start, end in normalize_ranges(ranges, file_size)))
+
+
+def contiguous_received_from_ranges(ranges: Iterable[Iterable[int]], file_size: Optional[int] = None) -> int:
+    merged = normalize_ranges(ranges, file_size)
+    if not merged or merged[0][0] != 0:
+        return 0
+    return int(merged[0][1])
+
+
+def missing_ranges_from_received(ranges: Iterable[Iterable[int]], file_size: int) -> List[List[int]]:
+    total = max(0, int(file_size or 0))
+    merged = normalize_ranges(ranges, total)
+    missing: List[List[int]] = []
+    cursor = 0
+    for start, end in merged:
+        if cursor < start:
+            missing.append([cursor, start])
+        cursor = max(cursor, end)
+    if cursor < total:
+        missing.append([cursor, total])
+    return missing
+
+
+def add_received_range(ranges: Iterable[Iterable[int]], start: int, end: int, file_size: Optional[int] = None) -> Tuple[List[List[int]], int]:
+    """Return merged ranges and the newly covered byte count."""
+    start = int(start or 0)
+    end = int(end or 0)
+    if file_size is not None:
+        fs = max(0, int(file_size))
+        start = min(max(0, start), fs)
+        end = min(max(0, end), fs)
+    if end <= start:
+        return normalize_ranges(ranges, file_size), 0
+    old_total = ranges_total_bytes(ranges, file_size)
+    merged = normalize_ranges([*(ranges or []), [start, end]], file_size)
+    new_total = ranges_total_bytes(merged, file_size)
+    return merged, max(0, new_total - old_total)
+
+
+def compute_file_transfer_weight(file_size: int) -> float:
+    size = max(0, int(file_size or 0))
+    if size < LARGE_FILE_THRESHOLD_BYTES:
+        return float(FILE_TRANSFER_SMALL_WEIGHT)
+    if size < 1024 * 1024 * 1024:
+        return float(FILE_TRANSFER_MEDIUM_WEIGHT)
+    return float(FILE_TRANSFER_LARGE_WEIGHT)
+
+
+def choose_file_transfer_slice_bytes(file_size: int) -> int:
+    return int(FILE_TRANSFER_SMALL_SLICE_BYTES if int(file_size or 0) < LARGE_FILE_THRESHOLD_BYTES else FILE_TRANSFER_LARGE_SLICE_BYTES)
+
+
+@dataclass
+class FileTransferTask:
+    """Persistent file-level state used by single-file and future batch transfer.
+
+    A task represents one logical file. For small sequential files the ranges
+    normally collapse to a single contiguous prefix. For large range-mode files,
+    received_ranges and missing_ranges can contain multiple disjoint intervals.
+    """
+
+    transfer_id: str
+    file_id: str
+    path: str
+    size: int
+    sha256: str
+    mode: str
+    received_ranges: List[List[int]] = field(default_factory=list)
+    missing_ranges: List[List[int]] = field(default_factory=list)
+    status: str = FILE_TRANSFER_STATUS_PENDING
+    relative_path: str = ""
+    content_file_key: str = ""
+    receiver_file_key: str = ""
+    scheduler_credit: float = 0.0
+    weight: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.size = max(0, int(self.size or 0))
+        self.path = str(self.path or "")
+        self.relative_path = canonical_relative_path(self.relative_path or Path(self.path).name or self.path or "unnamed")
+        self.transfer_id = str(self.transfer_id or self.file_id or "")
+        self.sha256 = str(self.sha256 or "").strip().lower()
+        if not self.content_file_key:
+            self.content_file_key = build_content_file_key(self.relative_path, self.size, self.sha256)
+        self.content_file_key = str(self.content_file_key or "")
+        self.receiver_file_key = str(self.receiver_file_key or "")
+        self.file_id = str(self.file_id or self.transfer_id or make_runtime_file_id(self.receiver_file_key or self.content_file_key))
+        self.mode = str(self.mode or choose_transfer_mode(self.size))
+        try:
+            self.scheduler_credit = float(self.scheduler_credit or 0.0)
+        except Exception:
+            self.scheduler_credit = 0.0
+        self.weight = float(self.weight or compute_file_transfer_weight(self.size))
+        self.received_ranges = normalize_ranges(self.received_ranges, self.size)
+        if self.missing_ranges:
+            self.missing_ranges = normalize_ranges(self.missing_ranges, self.size)
+        else:
+            self.refresh_missing_ranges()
+        if self.is_complete():
+            self.status = FILE_TRANSFER_STATUS_COMPLETED
+
+    @property
+    def received_bytes(self) -> int:
+        return ranges_total_bytes(self.received_ranges, self.size)
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, int(self.size) - int(self.received_bytes))
+
+    @property
+    def completion_ratio(self) -> float:
+        return (float(self.received_bytes) / float(self.size)) if self.size > 0 else 1.0
+
+    @property
+    def progress_pct(self) -> float:
+        return self.completion_ratio * 100.0
+
+    @property
+    def contiguous_received(self) -> int:
+        return contiguous_received_from_ranges(self.received_ranges, self.size)
+
+    @property
+    def is_small_file(self) -> bool:
+        return int(self.size) < int(LARGE_FILE_THRESHOLD_BYTES)
+
+    def refresh_missing_ranges(self) -> List[List[int]]:
+        self.received_ranges = normalize_ranges(self.received_ranges, self.size)
+        self.missing_ranges = missing_ranges_from_received(self.received_ranges, self.size)
+        return self.missing_ranges
+
+    def set_missing_ranges(self, ranges: Iterable[Iterable[int]]) -> List[List[int]]:
+        self.missing_ranges = normalize_ranges(ranges, self.size)
+        return self.missing_ranges
+
+    def add_received_range(self, start: int, end: int) -> int:
+        self.received_ranges, newly_added = add_received_range(self.received_ranges, start, end, self.size)
+        self.refresh_missing_ranges()
+        if self.is_complete():
+            self.status = FILE_TRANSFER_STATUS_COMPLETED
+        elif self.status == FILE_TRANSFER_STATUS_PENDING:
+            self.status = FILE_TRANSFER_STATUS_ACTIVE
+        return int(newly_added)
+
+    def consume_sent_range(self, original_range: Iterable[int], sent_until: int) -> List[List[int]]:
+        self.missing_ranges = consume_scheduled_range(self.missing_ranges, original_range, sent_until, self.size)
+        return self.missing_ranges
+
+    def is_complete(self) -> bool:
+        merged = normalize_ranges(self.received_ranges, self.size)
+        return self.size == 0 or (len(merged) == 1 and merged[0][0] == 0 and merged[0][1] >= self.size)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "transfer_id": self.transfer_id,
+            "file_id": self.file_id,
+            "path": self.path,
+            "relative_path": self.relative_path,
+            "content_file_key": self.content_file_key,
+            "receiver_file_key": self.receiver_file_key,
+            "scheduler_credit": float(self.scheduler_credit),
+            "weight": float(self.weight),
+            "size": int(self.size),
+            "sha256": self.sha256,
+            "mode": self.mode,
+            "received_ranges": normalize_ranges(self.received_ranges, self.size),
+            "missing_ranges": normalize_ranges(self.missing_ranges, self.size),
+            "status": self.status,
+            "received_bytes": int(self.received_bytes),
+            "remaining_bytes": int(self.remaining_bytes),
+            "progress_pct": float(self.progress_pct),
+            "contiguous_received": int(self.contiguous_received),
+        }
+
+    @classmethod
+    def from_dict(cls, obj: Dict[str, object]) -> "FileTransferTask":
+        data = obj if isinstance(obj, dict) else {}
+        return cls(
+            transfer_id=str(data.get("transfer_id") or data.get("file_id") or ""),
+            file_id=str(data.get("file_id") or data.get("transfer_id") or ""),
+            path=str(data.get("path") or data.get("relative_path") or data.get("name") or ""),
+            size=int(data.get("size") or 0),
+            sha256=str(data.get("sha256") or ""),
+            mode=str(data.get("mode") or data.get("transfer_mode") or choose_transfer_mode(int(data.get("size") or 0))),
+            received_ranges=data.get("received_ranges") or [],
+            missing_ranges=data.get("missing_ranges") or [],
+            status=str(data.get("status") or FILE_TRANSFER_STATUS_PENDING),
+            relative_path=str(data.get("relative_path") or data.get("path") or data.get("name") or ""),
+            content_file_key=str(data.get("content_file_key") or data.get("file_key") or ""),
+            receiver_file_key=str(data.get("receiver_file_key") or ""),
+            scheduler_credit=float(data.get("scheduler_credit") or 0.0),
+            weight=float(data.get("weight") or 0.0),
+        )
+
+
+@dataclass
+class BatchTransferTask:
+    """A batch-level container for one or more FileTransferTask objects."""
+
+    batch_id: str
+    files: Dict[str, FileTransferTask] = field(default_factory=dict)
+    total_size: int = 0
+    status: str = BATCH_TRANSFER_STATUS_PENDING
+
+    def __post_init__(self) -> None:
+        self.batch_id = str(self.batch_id or "")
+        normalized: Dict[str, FileTransferTask] = {}
+        for key, value in (self.files or {}).items():
+            task = value if isinstance(value, FileTransferTask) else FileTransferTask.from_dict(value)  # type: ignore[arg-type]
+            normalized[str(task.file_id or key)] = task
+        self.files = normalized
+        self.recompute_total_size()
+        if self.is_complete():
+            self.status = BATCH_TRANSFER_STATUS_COMPLETED
+
+    def recompute_total_size(self) -> int:
+        self.total_size = int(sum(max(0, int(task.size or 0)) for task in self.files.values()))
+        return self.total_size
+
+    def add_file(self, task: FileTransferTask) -> None:
+        self.files[str(task.file_id)] = task
+        self.recompute_total_size()
+        if self.status == BATCH_TRANSFER_STATUS_PENDING:
+            self.status = BATCH_TRANSFER_STATUS_ACTIVE
+
+    @property
+    def received_bytes(self) -> int:
+        return int(sum(task.received_bytes for task in self.files.values()))
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, int(self.total_size) - int(self.received_bytes))
+
+    @property
+    def completion_ratio(self) -> float:
+        return (float(self.received_bytes) / float(self.total_size)) if self.total_size > 0 else 1.0
+
+    @property
+    def progress_pct(self) -> float:
+        return self.completion_ratio * 100.0
+
+    @property
+    def completed_files(self) -> List[FileTransferTask]:
+        return [task for task in self.files.values() if task.is_complete() or task.status == FILE_TRANSFER_STATUS_COMPLETED]
+
+    @property
+    def pending_files(self) -> List[FileTransferTask]:
+        return [task for task in self.files.values() if task.status == FILE_TRANSFER_STATUS_PENDING]
+
+    @property
+    def active_file_tasks(self) -> List[FileTransferTask]:
+        return [task for task in self.files.values() if task.status == FILE_TRANSFER_STATUS_ACTIVE]
+
+    def is_complete(self) -> bool:
+        return bool(self.files) and all(task.is_complete() or task.status == FILE_TRANSFER_STATUS_COMPLETED for task in self.files.values())
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "batch_id": self.batch_id,
+            "total_size": int(self.total_size),
+            "status": self.status,
+            "received_bytes": int(self.received_bytes),
+            "remaining_bytes": int(self.remaining_bytes),
+            "progress_pct": float(self.progress_pct),
+            "files": {file_id: task.to_dict() for file_id, task in self.files.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, obj: Dict[str, object]) -> "BatchTransferTask":
+        data = obj if isinstance(obj, dict) else {}
+        files_obj = data.get("files") or {}
+        files: Dict[str, FileTransferTask] = {}
+        if isinstance(files_obj, dict):
+            for key, value in files_obj.items():
+                if isinstance(value, FileTransferTask):
+                    files[str(key)] = value
+                elif isinstance(value, dict):
+                    files[str(key)] = FileTransferTask.from_dict(value)
+        return cls(
+            batch_id=str(data.get("batch_id") or ""),
+            files=files,
+            total_size=int(data.get("total_size") or 0),
+            status=str(data.get("status") or BATCH_TRANSFER_STATUS_PENDING),
+        )
+
+
+class FileTransferManager:
+    """Session-level manager for independent file tasks.
+
+    This replaces the heavier batch semantics for the user's current product
+    model: a peer connection can keep up to 20 active file tasks. Additional
+    accepted files are registered immediately, get UI/progress state, and stay
+    pending until an active slot is freed. Scheduling is weighted round-robin:
+    all active files make progress, while small files receive higher weight.
+    """
+
+    def __init__(self, files: Optional[Iterable[FileTransferTask]] = None, max_active_files: int = DEFAULT_MAX_ACTIVE_FILE_TRANSFERS):
+        self.files: Dict[str, FileTransferTask] = {}
+        self.max_active_files = max(1, min(int(max_active_files or DEFAULT_MAX_ACTIVE_FILE_TRANSFERS), int(MAX_FILE_TRANSFER_TASKS)))
+        self.active_files: List[str] = []
+        self.pending_files: List[str] = []
+        self.completed_files: List[str] = []
+        self.failed_files: List[str] = []
+        self.cancelled_files: List[str] = []
+        for task in files or []:
+            self.add_file(task)
+        self._activate_pending()
+
+    @classmethod
+    def from_batch(cls, batch: BatchTransferTask, max_active_files: int = DEFAULT_MAX_ACTIVE_FILE_TRANSFERS) -> "FileTransferManager":
+        return cls(batch.files.values(), max_active_files=max_active_files)
+
+    def _sort_pending_small_first(self) -> None:
+        self.pending_files = sorted(
+            [fid for fid in self.pending_files if fid in self.files and not self.files[fid].is_complete()],
+            key=lambda fid: (
+                self.files[fid].remaining_bytes,
+                self.files[fid].size,
+                str(self.files[fid].relative_path or self.files[fid].path),
+            ),
+        )
+
+    def _activate_pending(self) -> None:
+        self._sort_pending_small_first()
+        while len(self.active_files) < self.max_active_files and self.pending_files:
+            fid = self.pending_files.pop(0)
+            task = self.files.get(fid)
+            if task is None:
+                continue
+            if task.is_complete():
+                self.mark_completed(fid)
+                continue
+            task.status = FILE_TRANSFER_STATUS_ACTIVE
+            if fid not in self.active_files:
+                self.active_files.append(fid)
+
+    def add_file(self, task: FileTransferTask) -> str:
+        fid = str(task.file_id or make_runtime_file_id(task.receiver_file_key or task.content_file_key))
+        task.file_id = fid
+        self.files[fid] = task
+        if task.is_complete() or task.status == FILE_TRANSFER_STATUS_COMPLETED:
+            task.status = FILE_TRANSFER_STATUS_COMPLETED
+            if fid not in self.completed_files:
+                self.completed_files.append(fid)
+            return fid
+        if len(self.active_files) < self.max_active_files:
+            task.status = FILE_TRANSFER_STATUS_ACTIVE
+            if fid not in self.active_files:
+                self.active_files.append(fid)
+        else:
+            task.status = FILE_TRANSFER_STATUS_PENDING
+            if fid not in self.pending_files:
+                self.pending_files.append(fid)
+            self._sort_pending_small_first()
+        return fid
+
+    def mark_completed(self, file_id: str) -> None:
+        fid = str(file_id)
+        task = self.files.get(fid)
+        if task is not None:
+            task.status = FILE_TRANSFER_STATUS_COMPLETED
+        self.active_files = [x for x in self.active_files if x != fid]
+        self.pending_files = [x for x in self.pending_files if x != fid]
+        if fid and fid not in self.completed_files:
+            self.completed_files.append(fid)
+        self._activate_pending()
+
+    def mark_failed(self, file_id: str) -> None:
+        fid = str(file_id)
+        task = self.files.get(fid)
+        if task is not None:
+            task.status = FILE_TRANSFER_STATUS_FAILED
+        self.active_files = [x for x in self.active_files if x != fid]
+        self.pending_files = [x for x in self.pending_files if x != fid]
+        if fid and fid not in self.failed_files:
+            self.failed_files.append(fid)
+        self._activate_pending()
+
+    def mark_cancelled(self, file_id: str) -> None:
+        fid = str(file_id)
+        task = self.files.get(fid)
+        if task is not None:
+            task.status = FILE_TRANSFER_STATUS_CANCELLED
+        self.active_files = [x for x in self.active_files if x != fid]
+        self.pending_files = [x for x in self.pending_files if x != fid]
+        if fid and fid not in self.cancelled_files:
+            self.cancelled_files.append(fid)
+        self._activate_pending()
+
+    def mark_paused(self, file_id: str) -> None:
+        fid = str(file_id)
+        task = self.files.get(fid)
+        if task is not None:
+            task.status = FILE_TRANSFER_STATUS_PAUSED
+        self.active_files = [x for x in self.active_files if x != fid]
+        self._activate_pending()
+
+    def resume_file(self, file_id: str) -> None:
+        fid = str(file_id)
+        task = self.files.get(fid)
+        if task is None or task.is_complete():
+            return
+        task.status = FILE_TRANSFER_STATUS_PENDING
+        if fid not in self.pending_files and fid not in self.active_files:
+            self.pending_files.append(fid)
+        self._activate_pending()
+
+    def has_work(self) -> bool:
+        self._activate_pending()
+        return any((fid in self.files and self.files[fid].status == FILE_TRANSFER_STATUS_ACTIVE and not self.files[fid].is_complete()) for fid in self.active_files)
+
+    def _recharge_credits(self) -> None:
+        for fid in list(self.active_files):
+            task = self.files.get(fid)
+            if task is None:
+                continue
+            if task.is_complete() or not task.missing_ranges:
+                self.mark_completed(fid)
+                continue
+            task.scheduler_credit += float(task.weight or compute_file_transfer_weight(task.size)) * float(FILE_TRANSFER_BASE_QUANTUM_BYTES)
+
+    def next_task(self) -> Optional[FileTransferTask]:
+        self._activate_pending()
+        active: List[FileTransferTask] = []
+        for fid in list(self.active_files):
+            task = self.files.get(fid)
+            if task is None:
+                continue
+            task.refresh_missing_ranges()
+            if task.is_complete() or not task.missing_ranges:
+                self.mark_completed(fid)
+                continue
+            if task.status == FILE_TRANSFER_STATUS_ACTIVE:
+                active.append(task)
+        if not active:
+            return None
+        # Deficit weighted round-robin. All active files accumulate credit; small
+        # files accumulate faster, so their progress bars move faster, but large
+        # files still receive credit and keep progressing.
+        self._recharge_credits()
+        active = [self.files[fid] for fid in self.active_files if fid in self.files and self.files[fid].status == FILE_TRANSFER_STATUS_ACTIVE and self.files[fid].missing_ranges]
+        if not active:
+            return None
+        def _key(task: FileTransferTask) -> Tuple[float, int, int, str]:
+            return (float(task.scheduler_credit), -int(task.remaining_bytes), -int(task.size), str(task.relative_path or task.path))
+        chosen = max(active, key=_key)
+        chosen.status = FILE_TRANSFER_STATUS_ACTIVE
+        return chosen
+
+    def note_slice_sent(self, file_id: str, sent_bytes: int) -> None:
+        task = self.files.get(str(file_id))
+        if task is None:
+            return
+        task.scheduler_credit -= float(max(0, int(sent_bytes or 0)))
+        # Keep credit bounded so a pending/paused interval does not build an
+        # excessively large burst when the file becomes active again.
+        cap = max(float(choose_file_transfer_slice_bytes(task.size)) * 4.0, float(FILE_TRANSFER_BASE_QUANTUM_BYTES))
+        if task.scheduler_credit > cap:
+            task.scheduler_credit = cap
+        if task.scheduler_credit < -cap:
+            task.scheduler_credit = -cap
+
+    @property
+    def active_count(self) -> int:
+        return len(self.active_files)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self.pending_files)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "max_active_files": int(self.max_active_files),
+            "active_files": list(self.active_files),
+            "pending_files": list(self.pending_files),
+            "completed_files": list(self.completed_files),
+            "failed_files": list(self.failed_files),
+            "cancelled_files": list(self.cancelled_files),
+            "files": {fid: task.to_dict() for fid, task in self.files.items()},
+        }
+
+
+# Backward-compatible name used by the current single-file sender. New code can
+# import FileTransferManager directly.
+FileBatchScheduler = FileTransferManager
+
+
+def range_scheduler_slice_bytes(network_mode: str) -> int:
+    mode = str(network_mode or RANGE_SCHEDULER_MODE_STABLE).strip().lower()
+    if mode == RANGE_SCHEDULER_MODE_UNSTABLE:
+        return int(RANGE_SCHEDULER_UNSTABLE_SLICE_BYTES)
+    return int(RANGE_SCHEDULER_STABLE_SLICE_BYTES)
+
+
+def classify_file_transfer_network_state(snapshot: Optional[Dict[str, object]] = None,
+                                         previous_snapshot: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    """Classify the current transfer path for file-range scheduling.
+
+    This is deliberately lightweight. It does not replace RUDP congestion
+    control; it only tells the file layer whether to prefer long sequential
+    slices or smaller repair-oriented slices.
+    """
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    prev = previous_snapshot if isinstance(previous_snapshot, dict) else {}
+
+    def _num(obj: Dict[str, object], key: str, default: float = 0.0) -> float:
+        try:
+            value = obj.get(key, default)
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    sent_now = _num(snap, "data_packets_sent_total")
+    sent_prev = _num(prev, "data_packets_sent_total")
+    retx_now = _num(snap, "data_packets_retx_total")
+    retx_prev = _num(prev, "data_packets_retx_total")
+    rto_now = _num(snap, "data_packets_retx_rto")
+    rto_prev = _num(prev, "data_packets_retx_rto")
+    dropped_now = _num(snap, "data_packets_dropped_retry_exhausted")
+    dropped_prev = _num(prev, "data_packets_dropped_retry_exhausted")
+
+    sent_delta = max(0.0, sent_now - sent_prev)
+    retx_delta = max(0.0, retx_now - retx_prev)
+    rto_delta = max(0.0, rto_now - rto_prev)
+    dropped_delta = max(0.0, dropped_now - dropped_prev)
+    retx_ratio = (retx_delta / sent_delta) if sent_delta > 0 else 0.0
+
+    srtt = _num(snap, "srtt", 0.0) or _num(snap, "ack1_srtt_s", 0.0)
+    rto = _num(snap, "rto", 0.0) or _num(snap, "ack1_rto_s", 0.0)
+    rto_stretched = bool(srtt > 0.0 and rto > max(0.5, 4.0 * srtt))
+
+    unstable = bool(
+        dropped_delta > 0
+        or rto_delta > 0
+        or retx_ratio >= 0.03
+        or rto_stretched
+    )
+    reasons: List[str] = []
+    if dropped_delta > 0:
+        reasons.append("retry_exhausted")
+    if rto_delta > 0:
+        reasons.append("rto_retx")
+    if retx_ratio >= 0.03:
+        reasons.append(f"retx_ratio={retx_ratio:.3f}")
+    if rto_stretched:
+        reasons.append(f"rto_stretched={rto:.3f}/{srtt:.3f}")
+
+    mode = RANGE_SCHEDULER_MODE_UNSTABLE if unstable else RANGE_SCHEDULER_MODE_STABLE
+    return {
+        "mode": mode,
+        "unstable": unstable,
+        "reasons": reasons,
+        "sent_delta": int(sent_delta),
+        "retx_delta": int(retx_delta),
+        "rto_delta": int(rto_delta),
+        "dropped_delta": int(dropped_delta),
+        "retx_ratio": float(retx_ratio),
+        "slice_bytes": range_scheduler_slice_bytes(mode),
+    }
+
+
+def score_missing_range(range_item: Iterable[int], file_size: int, received_bytes: int = 0,
+                        network_mode: str = RANGE_SCHEDULER_MODE_STABLE) -> float:
+    """Score a missing range. Higher score is sent earlier."""
+    try:
+        start, end = list(range_item)[:2]
+        start = max(0, int(start))
+        end = max(0, int(end))
+    except Exception:
+        return -1.0
+    total = max(1, int(file_size or 1))
+    if end <= start:
+        return -1.0
+    size = max(1, end - start)
+    size_mib = max(size / float(1024 * 1024), 0.25)
+    completion = min(1.0, max(0.0, float(received_bytes or 0) / float(total)))
+    remaining = max(0, total - int(received_bytes or 0))
+    near_complete = bool(completion >= RANGE_SCHEDULER_NEAR_COMPLETE_RATIO or remaining <= RANGE_SCHEDULER_NEAR_COMPLETE_REMAINING_BYTES)
+    unstable = str(network_mode or "").strip().lower() == RANGE_SCHEDULER_MODE_UNSTABLE
+
+    # Lower offset means closer to file head and more useful for contiguous
+    # prefix recovery. Smaller holes are cheaper to close and reduce range
+    # fragmentation. Near-complete files get an extra repair bias.
+    prefix_score = 1.0 - min(1.0, max(0.0, start / float(total)))
+    small_gap_score = 1.0 / size_mib
+    score = 0.0
+    score += 45.0 * prefix_score
+    score += (35.0 if unstable else 18.0) * small_gap_score
+    score += 20.0 * completion
+    if near_complete:
+        score += 25.0 * small_gap_score
+        score += 10.0 * prefix_score
+    if unstable:
+        # Under loss/RTO, avoid sitting on very large ranges for too long.
+        score -= min(20.0, size_mib / 64.0)
+    return float(score)
+
+
+def schedule_missing_ranges(missing_ranges: Iterable[Iterable[int]], file_size: int, received_bytes: int = 0,
+                            network_mode: str = RANGE_SCHEDULER_MODE_STABLE) -> List[List[int]]:
+    """Return missing ranges ordered by the single-file range scheduler."""
+    total = max(0, int(file_size or 0))
+    ranges = normalize_ranges(missing_ranges, total)
+    indexed = []
+    for idx, item in enumerate(ranges):
+        start, end = int(item[0]), int(item[1])
+        size = end - start
+        score = score_missing_range(item, total, received_bytes=received_bytes, network_mode=network_mode)
+        # Deterministic tiebreakers: earlier prefix first, then smaller gap.
+        indexed.append((-score, start, size, idx, [start, end]))
+    indexed.sort()
+    return [item for *_prefix, item in indexed]
+
+
+def consume_scheduled_range(pending_ranges: Iterable[Iterable[int]], selected: Iterable[int], consume_end: int,
+                            file_size: int) -> List[List[int]]:
+    """Remove [selected.start, consume_end) from pending ranges."""
+    pending = normalize_ranges(pending_ranges, file_size)
+    try:
+        selected_start, selected_end = list(selected)[:2]
+        selected_start = int(selected_start)
+        selected_end = int(selected_end)
+        consume_end = min(max(selected_start, int(consume_end)), selected_end)
+    except Exception:
+        return pending
+    out: List[List[int]] = []
+    consumed = False
+    for start, end in pending:
+        if (not consumed) and int(start) == selected_start and int(end) == selected_end:
+            if consume_end < end:
+                out.append([consume_end, end])
+            consumed = True
+        else:
+            out.append([start, end])
+    return normalize_ranges(out, file_size)
 
 
 def _run_powershell_json(command: str) -> object:
@@ -565,7 +1606,6 @@ def probe_save_directory(directory: str, required_bytes: int = 0, reserve_bytes:
     except Exception as exc:
         return {"ok": False, "code": "save_dir_not_writable", "detail": str(exc), "path": str(base_dir)}
     try:
-        import shutil
         usage = shutil.disk_usage(str(base_dir))
         need = max(0, int(required_bytes or 0)) + max(0, int(reserve_bytes or 0))
         if int(usage.free) < need:
@@ -628,17 +1668,38 @@ def read_resume_meta(part_path: Path | str) -> Dict[str, object]:
     return obj if isinstance(obj, dict) else {}
 
 
-def write_resume_meta(part_path: Path | str, meta: Dict[str, object], out_path: Path | str, received_bytes: int) -> None:
+def write_resume_meta(part_path: Path | str, meta: Dict[str, object], out_path: Path | str, received_bytes: int,
+                      received_ranges: Optional[Iterable[Iterable[int]]] = None) -> None:
     part = Path(part_path)
     meta_path = resume_meta_path(part)
+    file_size = int(meta.get("size") or 0)
+    if received_ranges is None:
+        rb = min(max(0, int(received_bytes or 0)), file_size)
+        ranges = [[0, rb]] if rb > 0 else []
+    else:
+        ranges = normalize_ranges(received_ranges, file_size)
+    total_received = ranges_total_bytes(ranges, file_size)
+    contiguous_received = contiguous_received_from_ranges(ranges, file_size)
+    transfer_mode = str(meta.get("transfer_mode") or choose_transfer_mode(file_size))
     obj = {
-        "version": 2,
+        "version": 3,
         "transfer_id": make_transfer_id(meta),
+        "file_id": str(meta.get("file_id") or ""),
+        "content_file_key": str(meta.get("content_file_key") or ""),
+        "receiver_file_key": str(meta.get("receiver_file_key") or ""),
+        "relative_path": canonical_relative_path(str(meta.get("relative_path") or meta.get("name") or "")),
         "name": str(meta.get("name") or ""),
-        "size": int(meta.get("size") or 0),
+        "size": file_size,
         "sha256": str(meta.get("sha256") or "").strip().lower(),
         "payload_size": int(meta.get("payload_size") or 0),
-        "received_bytes": int(max(0, int(received_bytes or 0))),
+        "transfer_mode": transfer_mode,
+        "large_file_threshold_bytes": LARGE_FILE_THRESHOLD_BYTES,
+        "received_bytes": int(total_received),
+        "received_bytes_total": int(total_received),
+        "contiguous_received": int(contiguous_received),
+        "received_ranges": ranges,
+        "preallocated": True,
+        "logical_size": file_size,
         "out_path": str(out_path),
         "part_path": str(part),
         "updated_at": time.time(),
@@ -661,12 +1722,14 @@ def resume_candidate_info(directory: str, meta: Dict[str, object]) -> Dict[str, 
     """Inspect whether an existing .part file can be resumed.
 
     The current implementation uses implicit file offsets: the sender starts at
-    `resume_offset`, while the receiver appends to the existing .part file.
-    The offset is aligned down to payload_size to avoid partial-chunk ambiguity.
+    `resume_offset`, while the receiver seeks to that offset in a logically
+    preallocated .part file. Therefore valid progress is read from metadata, not
+    from the .part file length. The offset is aligned down to payload_size to
+    avoid partial-chunk ambiguity.
     """
     base_dir = Path(directory).expanduser().resolve()
-    safe = safe_filename(str(meta.get("name") or "received.bin"))
-    out_path = base_dir / safe
+    rel = canonical_relative_path(str(meta.get("relative_path") or meta.get("name") or "received.bin"))
+    out_path = allocate_output_path_for_relative(str(base_dir), rel, policy="overwrite")
     part_path = Path(str(out_path) + ".part")
     info: Dict[str, object] = {
         "resume_available": False,
@@ -683,6 +1746,11 @@ def resume_candidate_info(directory: str, meta: Dict[str, object]) -> Dict[str, 
     saved = read_resume_meta(part_path)
     if not saved:
         info["reason"] = "meta_missing"
+        return info
+    expected_file_key = str(meta.get("receiver_file_key") or meta.get("content_file_key") or "")
+    saved_file_key = str(saved.get("receiver_file_key") or saved.get("content_file_key") or "")
+    if expected_file_key and saved_file_key and expected_file_key != saved_file_key:
+        info["reason"] = "file_key_mismatch"
         return info
     expected_transfer_id = make_transfer_id(meta)
     saved_transfer_id = make_transfer_id(saved)
@@ -707,26 +1775,56 @@ def resume_candidate_info(directory: str, meta: Dict[str, object]) -> Dict[str, 
         return info
     total = int(meta.get("size") or 0)
     payload_size = max(1, int(meta.get("payload_size") or 1))
-    saved_bytes = int(saved.get("received_bytes") or 0)
-    offset = min(actual_size, saved_bytes, total)
-    if offset <= 0:
+    saved_ranges = saved.get("received_ranges")
+    if isinstance(saved_ranges, list):
+        ranges = normalize_ranges(saved_ranges, total)
+    else:
+        saved_bytes = int(saved.get("contiguous_received") if saved.get("contiguous_received") is not None else (saved.get("received_bytes") or 0))
+        offset_legacy = min(max(0, saved_bytes), total)
+        ranges = [[0, offset_legacy]] if offset_legacy > 0 else []
+    # For preallocated files actual_size may equal total from the start, so the
+    # real resumable progress must come from metadata. For legacy append-only
+    # partial files, cap by actual_size as a safety guard.
+    if bool(saved.get("preallocated")):
+        if actual_size < total:
+            info["reason"] = "preallocated_size_mismatch"
+            return info
+    else:
+        ranges = normalize_ranges([[0, min(actual_size, contiguous_received_from_ranges(ranges, total), total)]], total)
+    total_received = ranges_total_bytes(ranges, total)
+    contiguous = contiguous_received_from_ranges(ranges, total)
+    missing = missing_ranges_from_received(ranges, total)
+    if total_received <= 0:
         info["reason"] = "empty_part"
         return info
-    if offset >= total:
-        # A full .part exists but has not been finalized. Re-verify by receiving
-        # zero bytes is not supported in the first resume version; restart or
-        # overwrite is safer.
-        offset = total
-    aligned = offset - (offset % payload_size)
-    if aligned <= 0 and offset > 0:
-        aligned = 0
+    transfer_mode = str(saved.get("transfer_mode") or meta.get("transfer_mode") or choose_transfer_mode(total))
+    # Align range boundaries down/up to payload boundaries where possible. This
+    # keeps resume packets on the same chunk grid used by the sender.
+    aligned_ranges = []
+    for start, end in ranges:
+        a = start - (start % payload_size)
+        b = end - (end % payload_size)
+        if end == total:
+            b = total
+        if b > a:
+            aligned_ranges.append([a, b])
+    ranges = normalize_ranges(aligned_ranges, total)
+    total_received = ranges_total_bytes(ranges, total)
+    contiguous = contiguous_received_from_ranges(ranges, total)
+    missing = missing_ranges_from_received(ranges, total)
+    resumable = bool(total_received > 0 and total_received < total and missing)
     info.update({
-        "resume_available": bool(aligned > 0 and aligned < total),
-        "resume_offset": int(aligned),
-        "resume_pct": (float(aligned) * 100.0 / float(total)) if total > 0 else 0.0,
+        "resume_available": resumable,
+        "resume_offset": int(contiguous),
+        "resume_pct": (float(total_received) * 100.0 / float(total)) if total > 0 else 0.0,
         "actual_part_size": actual_size,
-        "meta_received_bytes": saved_bytes,
-        "reason": "ok" if aligned > 0 and aligned < total else "not_resumable_size",
+        "meta_received_bytes": total_received,
+        "received_bytes_total": total_received,
+        "contiguous_received": contiguous,
+        "received_ranges": ranges,
+        "missing_ranges": missing,
+        "transfer_mode": transfer_mode,
+        "reason": "ok" if resumable else "not_resumable_size",
     })
     return info
 
@@ -745,7 +1843,10 @@ def build_file_header(path: str, payload_size: int, sha256_hex: Optional[str] = 
         "size": int(size),
         "payload_size": int(payload_size),
         "sha256": str(sha256_hex),
+        "transfer_mode": choose_transfer_mode(int(size)),
+        "large_file_threshold_bytes": LARGE_FILE_THRESHOLD_BYTES,
         "resume_supported": True,
+        "range_resume_supported": True,
         "mtime_ns": int(p.stat().st_mtime_ns),
     }
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -785,6 +1886,9 @@ def parse_file_header(data: bytes) -> Dict[str, object]:
         "size": size,
         "payload_size": payload_size,
         "sha256": sha256_hex,
+        "transfer_mode": str(obj.get("transfer_mode") or choose_transfer_mode(size)),
+        "large_file_threshold_bytes": int(obj.get("large_file_threshold_bytes") or LARGE_FILE_THRESHOLD_BYTES),
         "resume_supported": bool(obj.get("resume_supported", version >= 2)),
+        "range_resume_supported": bool(obj.get("range_resume_supported", False)),
         "mtime_ns": int(obj.get("mtime_ns") or 0),
     }

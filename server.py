@@ -35,16 +35,32 @@ from file_transfer_common import (
     DEFAULT_DISCOVERY_PORT,
     DISCOVERY_MAGIC,
     EOF_PAYLOAD,
+    TRANSFER_MODE_LARGE_RANGE,
+    FILE_TRANSFER_STATUS_ACTIVE,
+    FileTransferTask,
+    add_received_range,
     build_discovery_response,
     allocate_output_path,
+    allocate_output_path_for_relative,
+    build_file_offer_accept,
+    build_receiver_file_key,
     build_transfer_decision,
     build_transfer_request_log,
     build_transfer_request_obj,
     build_user_error,
     output_conflict_info,
+    output_conflict_info_for_relative,
     parse_file_header,
+    parse_file_offer,
     print_local_ip_candidates,
     probe_save_directory,
+    storage_space_warning_info,
+    logical_preallocate_file,
+    missing_ranges_from_received,
+    normalize_ranges,
+    parse_file_body_frame,
+    parse_file_body_frame_ex,
+    ranges_total_bytes,
     unique_path,
     resume_candidate_info,
     write_resume_meta,
@@ -386,6 +402,13 @@ class RUDPFileReceiver:
             resume_offset=int(conflict.get("resume_offset") or 0),
             resume_pct=float(conflict.get("resume_pct") or 0.0),
             resume_reason=str(conflict.get("resume_reason") or conflict.get("reason") or ""),
+            storage_warning=bool(conflict.get("storage_warning")),
+            storage_space_unknown=bool(conflict.get("storage_space_unknown")),
+            storage_free_bytes=int(conflict.get("storage_free_bytes") or 0),
+            storage_file_bytes=int(conflict.get("storage_file_bytes") or int(meta.get("size") or 0)),
+            storage_reserve_bytes=int(conflict.get("storage_reserve_bytes") or 0),
+            storage_threshold_bytes=int(conflict.get("storage_threshold_bytes") or 0),
+            storage_warning_detail=str(conflict.get("storage_warning_detail") or ""),
             default_file_policy="resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite"),
         )
         request_path = adir / f"{int(conn_id)}.request.json"
@@ -408,6 +431,13 @@ class RUDPFileReceiver:
             resume_available=req_obj.get("resume_available"),
             resume_offset=req_obj.get("resume_offset"),
             resume_pct=req_obj.get("resume_pct"),
+            storage_warning=req_obj.get("storage_warning"),
+            storage_space_unknown=req_obj.get("storage_space_unknown"),
+            storage_free_bytes=req_obj.get("storage_free_bytes"),
+            storage_file_bytes=req_obj.get("storage_file_bytes"),
+            storage_reserve_bytes=req_obj.get("storage_reserve_bytes"),
+            storage_threshold_bytes=req_obj.get("storage_threshold_bytes"),
+            storage_warning_detail=req_obj.get("storage_warning_detail"),
             default_file_policy=req_obj.get("default_file_policy"),
         ))
         self.logger.info(f"Session {conn_id}: waiting for receiver approval")
@@ -477,6 +507,9 @@ class RUDPFileReceiver:
         print(f"Size: {meta.get('size')} bytes")
         print(f"SHA256: {meta.get('sha256')}")
         print(f"Suggested save path: {suggested_path}")
+        if bool(conflict.get("storage_warning")):
+            print("Storage warning: available space is less than file size plus 5 GiB reserve.")
+            print(f"Free={int(conflict.get('storage_free_bytes') or 0)} bytes, threshold={int(conflict.get('storage_threshold_bytes') or 0)} bytes")
         policy = "resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite")
         if bool(conflict.get("resume_available")):
             print(f"Resume candidate found: offset={int(conflict.get('resume_offset') or 0)} bytes ({float(conflict.get('resume_pct') or 0.0):.2f}%).")
@@ -501,22 +534,54 @@ class RUDPFileReceiver:
     def _app_handler(self, session: ReliableUDPSession) -> None:
         cid = int(session.conn_id)
         peer_addr = session.peer_addr
-        header_seen = False
+        offer_seen = False
         eof_seen = False
-        meta: Optional[Dict[str, object]] = None
-        out_path: Optional[Path] = None
-        part_path: Optional[Path] = None
-        out_f = None
-        sha = hashlib.sha256()
-        expected_total: Optional[int] = None
+        offer_id = ""
+        file_states: Dict[str, Dict[str, object]] = {}
+        expected_total = 0
         bytes_recv = 0
         pkts_recv = 0
         start_ts = time.time()
         last_report_ts = start_ts
         last_report_bytes = 0
-        last_meta_update_ts = start_ts
-        last_meta_update_bytes = 0
         exit_reason = "unknown"
+        server_data_seq = 1
+
+        def _send_offer_accept(oid: str, accepted: bool, files: List[Dict[str, object]], reason: str, **extra) -> None:
+            nonlocal server_data_seq
+            session.send_app_data(server_data_seq, build_file_offer_accept(oid, bool(accepted), files, str(reason), cid, **extra))
+            server_data_seq += 1
+
+        def _sum_received() -> int:
+            total = 0
+            for st in file_states.values():
+                task = st.get("task")
+                if isinstance(task, FileTransferTask):
+                    total += int(task.received_bytes)
+            return int(total)
+
+        def _close_all() -> None:
+            for st in file_states.values():
+                f = st.get("out_f")
+                if f is not None:
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+                    st["out_f"] = None
+
+        def _file_meta_from_legacy(meta: Dict[str, object]) -> Dict[str, object]:
+            rel = str(meta.get("relative_path") or meta.get("name") or "received.bin")
+            meta = dict(meta)
+            meta.setdefault("relative_path", rel)
+            meta.setdefault("file_id", str(meta.get("transfer_id") or meta.get("sha256") or ""))
+            meta.setdefault("content_file_key", "")
+            return meta
 
         try:
             while True:
@@ -545,144 +610,254 @@ class RUDPFileReceiver:
                     break
                 data = bytes(data_or_len or b"")
 
-                if not header_seen:
+                incoming_offer = None
+                try:
+                    incoming_offer = parse_file_offer(data)
+                except Exception:
+                    incoming_offer = None
+
+                if (not offer_seen) or incoming_offer is not None:
+                    is_dynamic_offer = bool(offer_seen and incoming_offer is not None)
                     if data == EOF_PAYLOAD:
-                        exit_reason = "eof_before_header"
+                        exit_reason = "eof_before_offer"
                         session.abort(exit_reason)
                         break
-                    meta = parse_file_header(data)
-                    expected_total = int(meta["size"])
-
-                    save_check = probe_save_directory(str(self.args.save_dir), required_bytes=expected_total)
-                    if not bool(save_check.get("ok")):
-                        exit_reason = str(save_check.get("code") or "save_dir_error")
-                        detail = str(save_check.get("detail") or "")
-                        self.logger.error(build_user_error(exit_reason, "Receiver cannot save the incoming file", detail))
-                        try:
-                            session.send_app_data(1, build_transfer_decision(False, exit_reason, cid, detail=detail))
-                        except Exception as exc:
-                            self.logger.warning(f"Session {cid}: failed to send transfer decision: {exc}")
-                        time.sleep(0.2)
-                        session.abort(exit_reason)
-                        break
-
-                    conflict = output_conflict_info(str(self.args.save_dir), str(meta["name"]))
-                    resume_info = resume_candidate_info(str(self.args.save_dir), meta)
-                    conflict.update({
-                        "resume_available": bool(resume_info.get("resume_available")),
-                        "resume_offset": int(resume_info.get("resume_offset") or 0),
-                        "resume_pct": float(resume_info.get("resume_pct") or 0.0),
-                        "resume_reason": str(resume_info.get("reason") or ""),
-                    })
-                    if bool(conflict.get("resume_available")):
-                        suggested_path = Path(str(resume_info.get("out_path")))
-                    else:
-                        suggested_path = allocate_output_path(str(self.args.save_dir), str(meta["name"]), policy="rename" if bool(conflict.get("conflict")) else "overwrite")
-
-                    accepted, decision_reason, decision = self._ask_accept(cid, peer_addr, meta, suggested_path, conflict)
-                    policy = str((decision or {}).get("file_policy") or ("resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite"))).strip().lower()
-                    if policy not in ("resume", "rename", "overwrite"):
-                        policy = "rename" if bool(conflict.get("conflict")) else "overwrite"
-
-                    resume_offset = 0
-                    if policy == "resume" and bool(conflict.get("resume_available")):
-                        out_path = Path(str(resume_info.get("out_path")))
-                        part_path = Path(str(resume_info.get("part_path")))
-                        resume_offset = int(resume_info.get("resume_offset") or 0)
-                        payload = max(1, int(meta.get("payload_size") or 1))
-                        resume_offset -= resume_offset % payload
-                        if resume_offset <= 0 or resume_offset >= int(expected_total or 0):
-                            policy = "overwrite"
-                            resume_offset = 0
-                    if policy != "resume":
-                        out_path = allocate_output_path(str(self.args.save_dir), str(meta["name"]), policy=policy)
-                        part_path = Path(str(out_path) + ".part")
-
-                    resume_pct = (resume_offset * 100.0 / max(int(expected_total or 0), 1)) if resume_offset > 0 else 0.0
                     try:
-                        session.send_app_data(1, build_transfer_decision(
-                            bool(accepted), str(decision_reason), cid,
-                            file_policy=policy, resume=(policy == "resume" and resume_offset > 0),
-                            resume_offset=int(resume_offset), resume_pct=float(resume_pct),
-                        ))
-                    except Exception as exc:
-                        self.logger.warning(f"Session {cid}: failed to send transfer decision: {exc}")
-                    if not accepted:
-                        exit_reason = "user_rejected" if decision_reason == "rejected" else str(decision_reason or "user_rejected")
-                        time.sleep(0.2)
-                        session.abort(exit_reason)
-                        break
-
-                    try:
-                        if policy == "resume" and resume_offset > 0 and part_path is not None:
-                            with open(part_path, "r+b") as fp:
-                                fp.truncate(int(resume_offset))
-                            out_f = open(part_path, "ab")
-                            bytes_recv = int(resume_offset)
-                            last_report_bytes = int(resume_offset)
-                            self.logger.info(
-                                f"Session {cid}: resume accepted; offset={resume_offset}/{expected_total} bytes "
-                                f"({resume_pct:.2f}%) -> {out_path}"
-                            )
+                        offer = incoming_offer if incoming_offer is not None else parse_file_offer(data)
+                        offer_id = str(offer.get("offer_id") or f"offer_{cid}")
+                        offer_files = list(offer.get("files") or [])
+                    except Exception:
+                        if offer_seen:
+                            offer_files = []
                         else:
-                            try:
-                                if part_path is not None and part_path.exists():
-                                    part_path.unlink()
-                                    remove_resume_meta(part_path)
-                            except Exception:
-                                pass
-                            out_f = open(part_path, "wb")
-                            bytes_recv = 0
-                            last_report_bytes = 0
-                    except Exception as exc:
-                        exit_reason = "output_open_failed"
-                        detail = str(exc)
-                        self.logger.error(build_user_error(exit_reason, "Receiver failed to open output file", detail))
+                            # Backward-compatible single-file header path.
+                            meta0 = parse_file_header(data)
+                            offer_id = f"legacy_{cid}"
+                            offer_files = [_file_meta_from_legacy(meta0)]
+
+                    if not offer_files:
+                        exit_reason = "empty_file_offer"
+                        session.abort(exit_reason)
+                        break
+                    if False and len(offer_files) > 20:
+                        exit_reason = "too_many_files"
                         try:
-                            session.send_app_data(1, build_transfer_decision(False, exit_reason, cid, detail=detail))
+                            _send_offer_accept(offer_id, False, [], exit_reason)
                         except Exception:
                             pass
                         session.abort(exit_reason)
                         break
 
+                    save_check = probe_save_directory(str(self.args.save_dir), required_bytes=0)
+                    if not bool(save_check.get("ok")):
+                        exit_reason = str(save_check.get("code") or "save_dir_error")
+                        detail = str(save_check.get("detail") or "")
+                        self.logger.error(build_user_error(exit_reason, "Receiver cannot save the incoming file", detail))
+                        try:
+                            _send_offer_accept(offer_id, False, [], exit_reason, detail=detail)
+                        except Exception:
+                            pass
+                        time.sleep(0.2)
+                        session.abort(exit_reason)
+                        break
+
+                    prepared = []
+                    for meta_raw in offer_files:
+                        meta = dict(meta_raw)
+                        rel = str(meta.get("relative_path") or meta.get("name") or "received.bin")
+                        meta["relative_path"] = rel
+                        meta["receiver_file_key"] = build_receiver_file_key(str(peer_addr[0]), str(Path(self.args.save_dir).expanduser().resolve()), rel, int(meta.get("size") or 0), str(meta.get("sha256") or ""))
+                        if not meta.get("file_id"):
+                            meta["file_id"] = str(meta.get("receiver_file_key") or meta.get("transfer_id") or meta.get("sha256"))[:24]
+                        conflict = output_conflict_info_for_relative(str(self.args.save_dir), rel)
+                        resume_info = resume_candidate_info(str(self.args.save_dir), meta)
+                        storage_info = storage_space_warning_info(str(self.args.save_dir), int(meta.get("size") or 0))
+                        conflict.update({
+                            "resume_available": bool(resume_info.get("resume_available")),
+                            "resume_offset": int(resume_info.get("resume_offset") or 0),
+                            "resume_pct": float(resume_info.get("resume_pct") or 0.0),
+                            "received_ranges": resume_info.get("received_ranges") or [],
+                            "missing_ranges": resume_info.get("missing_ranges") or [],
+                            "received_bytes_total": int(resume_info.get("received_bytes_total") or 0),
+                            "transfer_mode": str(meta.get("transfer_mode") or resume_info.get("transfer_mode") or "small_sequential"),
+                            "resume_reason": str(resume_info.get("reason") or ""),
+                        })
+                        conflict.update(storage_info)
+                        prepared.append({"meta": meta, "conflict": conflict, "resume_info": resume_info})
+
+                    # Current UI supports one request object. For an offer with multiple files,
+                    # use one aggregate confirmation but keep per-file storage/resume state.
+                    if len(prepared) == 1:
+                        ask_meta = prepared[0]["meta"]
+                        ask_conflict = prepared[0]["conflict"]
+                        ask_suggested = Path(str(prepared[0]["resume_info"].get("out_path") or ask_conflict.get("original_path") or self.args.save_dir))
+                    else:
+                        total_size = sum(int(x["meta"].get("size") or 0) for x in prepared)
+                        ask_meta = {"name": f"{len(prepared)} files", "size": total_size, "sha256": "", "payload_size": int(prepared[0]["meta"].get("payload_size") or 0)}
+                        ask_conflict = {"conflict": False, "resume_available": False, "files": [x["meta"] for x in prepared]}
+                        ask_suggested = Path(self.args.save_dir)
+                    accepted, decision_reason, decision = self._ask_accept(cid, peer_addr, ask_meta, ask_suggested, ask_conflict)
+
+                    accepted_files = []
+                    if accepted:
+                        for item2 in prepared:
+                            meta = item2["meta"]
+                            conflict = item2["conflict"]
+                            resume_info = item2["resume_info"]
+                            policy = str((decision or {}).get("file_policy") or ("resume" if bool(conflict.get("resume_available")) else ("rename" if bool(conflict.get("conflict")) else "overwrite"))).strip().lower()
+                            if policy not in ("resume", "rename", "overwrite"):
+                                policy = "rename" if bool(conflict.get("conflict")) else "overwrite"
+                            expected_one = int(meta.get("size") or 0)
+                            transfer_mode = str(meta.get("transfer_mode") or "small_sequential")
+                            if policy == "resume" and bool(conflict.get("resume_available")):
+                                out_path = Path(str(resume_info.get("out_path")))
+                                part_path = Path(str(resume_info.get("part_path")))
+                                received_ranges = normalize_ranges(resume_info.get("received_ranges") or [], expected_one)
+                            else:
+                                out_path = allocate_output_path_for_relative(str(self.args.save_dir), str(meta.get("relative_path") or meta.get("name") or "received.bin"), policy=policy)
+                                part_path = Path(str(out_path) + ".part")
+                                received_ranges = []
+                                try:
+                                    if part_path.exists():
+                                        part_path.unlink()
+                                        remove_resume_meta(part_path)
+                                except Exception:
+                                    pass
+                            received_total = ranges_total_bytes(received_ranges, expected_one)
+                            missing_ranges = missing_ranges_from_received(received_ranges, expected_one)
+                            try:
+                                logical_preallocate_file(part_path, expected_one)
+                                out_f = open(part_path, "r+b")
+                            except Exception as exc:
+                                self.logger.error(build_user_error("output_open_failed", "Receiver failed to open output file", str(exc)))
+                                continue
+                            task = FileTransferTask(
+                                transfer_id=str(meta.get("transfer_id") or meta.get("sha256") or ""),
+                                file_id=str(meta.get("file_id") or meta.get("receiver_file_key") or meta.get("sha256") or "")[:255],
+                                path=str(part_path),
+                                size=expected_one,
+                                sha256=str(meta.get("sha256") or ""),
+                                mode=transfer_mode,
+                                received_ranges=received_ranges,
+                                missing_ranges=missing_ranges,
+                                status=FILE_TRANSFER_STATUS_ACTIVE,
+                                relative_path=str(meta.get("relative_path") or meta.get("name") or ""),
+                                content_file_key=str(meta.get("content_file_key") or ""),
+                                receiver_file_key=str(meta.get("receiver_file_key") or ""),
+                            )
+                            file_states[task.file_id] = {
+                                "task": task,
+                                "meta": meta,
+                                "out_path": out_path,
+                                "part_path": part_path,
+                                "out_f": out_f,
+                                "last_meta_update_ts": now,
+                                "last_meta_update_bytes": int(received_total),
+                            }
+                            try:
+                                write_resume_meta(part_path, meta, out_path, int(received_total), received_ranges)
+                            except Exception as exc:
+                                self.logger.warning(f"Session {cid}: failed to write resume meta for {task.file_id}: {exc}")
+                            accepted_files.append({
+                                "file_id": task.file_id,
+                                "content_file_key": task.content_file_key,
+                                "receiver_file_key": task.receiver_file_key,
+                                "relative_path": task.relative_path,
+                                "file_policy": policy,
+                                "resume": bool(received_total > 0),
+                                "resume_offset": int(task.contiguous_received),
+                                "resume_pct": float(task.progress_pct),
+                                "transfer_mode": transfer_mode,
+                                "received_ranges": task.received_ranges,
+                                "missing_ranges": task.missing_ranges,
+                                "received_bytes_total": int(task.received_bytes),
+                            })
                     try:
-                        if part_path is not None and out_path is not None:
-                            write_resume_meta(part_path, meta, out_path, int(bytes_recv))
+                        _send_offer_accept(offer_id, bool(accepted and accepted_files), accepted_files, str(decision_reason))
                     except Exception as exc:
-                        self.logger.warning(f"Session {cid}: failed to write resume meta: {exc}")
-                    header_seen = True
-                    self.logger.info(
-                        f"Session {cid}: transfer accepted; receiving {meta['name']} from {peer_addr}, "
-                        f"size={expected_total} bytes -> {out_path}, policy={policy}, resume_offset={resume_offset}"
-                    )
+                        self.logger.warning(f"Session {cid}: failed to send file offer accept: {exc}")
+                    if not accepted or not accepted_files:
+                        if bool(is_dynamic_offer):
+                            self.logger.info(f"Session {cid}: dynamic file offer {offer_id} rejected: {decision_reason}; continuing existing transfer")
+                            continue
+                        exit_reason = "user_rejected" if decision_reason == "rejected" else str(decision_reason or "user_rejected")
+                        time.sleep(0.2)
+                        session.abort(exit_reason)
+                        break
+
+                    expected_total = sum(int(st["task"].size) for st in file_states.values() if isinstance(st.get("task"), FileTransferTask))
+                    bytes_recv = _sum_received()
+                    last_report_bytes = bytes_recv
+                    offer_seen = True
+                    self.logger.info(f"Session {cid}: accepted file offer {offer_id}; files={len(file_states)}, expected_total={expected_total}, received={bytes_recv}")
                     continue
 
                 if data == EOF_PAYLOAD:
                     eof_seen = True
-                    if out_f is not None:
-                        out_f.flush()
-                        os.fsync(out_f.fileno())
-                        out_f.close()
-                        out_f = None
+                    _close_all()
                     break
 
-                if out_f is None:
+                if not file_states:
                     exit_reason = "output_not_open"
                     session.abort(exit_reason)
                     break
 
-                out_f.write(data)
-                sha.update(data)
-                bytes_recv += len(data)
-                pkts_recv += 1
-
-                if part_path is not None and out_path is not None and (bytes_recv - last_meta_update_bytes >= 4 * 1024 * 1024 or now - last_meta_update_ts >= 1.0):
+                try:
                     try:
-                        write_resume_meta(part_path, meta or {}, out_path, int(bytes_recv))
-                        last_meta_update_bytes = int(bytes_recv)
-                        last_meta_update_ts = now
+                        file_id, file_offset, payload = parse_file_body_frame_ex(data)
+                    except Exception:
+                        if len(file_states) != 1:
+                            raise
+                        file_id = next(iter(file_states.keys()))
+                        st0 = file_states[file_id]
+                        task0 = st0.get("task")
+                        file_offset = int(task0.received_bytes if isinstance(task0, FileTransferTask) else 0)
+                        payload = data
+                    if not file_id:
+                        if len(file_states) == 1:
+                            file_id = next(iter(file_states.keys()))
+                        else:
+                            raise ValueError("missing_file_id")
+                    st = file_states.get(str(file_id))
+                    if st is None:
+                        raise ValueError(f"unknown_file_id:{file_id}")
+                    task = st.get("task")
+                    if not isinstance(task, FileTransferTask):
+                        raise ValueError("invalid_file_task")
+                    file_end = int(file_offset) + len(payload)
+                    if file_offset < 0 or file_end > int(task.size):
+                        raise ValueError(f"file_body_range_out_of_bounds file_id={file_id} offset={file_offset} end={file_end} total={task.size}")
+                    out_f = st.get("out_f")
+                    if out_f is None:
+                        out_f = open(Path(str(st.get("part_path"))), "r+b")
+                        st["out_f"] = out_f
+                    out_f.seek(int(file_offset))
+                    out_f.write(payload)
+                except OSError as exc:
+                    exit_reason = "disk_write_failed"
+                    self.logger.error(build_user_error(exit_reason, "Receiver failed while writing file data", str(exc)))
+                    session.abort(exit_reason)
+                    break
+                except Exception as exc:
+                    exit_reason = "invalid_file_body"
+                    self.logger.error(build_user_error(exit_reason, "Receiver failed to parse or place file data", str(exc)))
+                    session.abort(exit_reason)
+                    break
+
+                task.add_received_range(int(file_offset), int(file_end))
+                bytes_recv = _sum_received()
+                pkts_recv += 1
+                st["last_seen_ts"] = now
+
+                last_meta_ts = float(st.get("last_meta_update_ts") or start_ts)
+                last_meta_bytes = int(st.get("last_meta_update_bytes") or 0)
+                if task.received_bytes - last_meta_bytes >= 4 * 1024 * 1024 or now - last_meta_ts >= 1.0:
+                    try:
+                        write_resume_meta(st["part_path"], st.get("meta") or {}, st["out_path"], int(task.received_bytes), task.received_ranges)
+                        st["last_meta_update_bytes"] = int(task.received_bytes)
+                        st["last_meta_update_ts"] = now
                     except Exception as exc:
-                        self.logger.warning(f"Session {cid}: failed to update resume meta: {exc}")
+                        self.logger.warning(f"Session {cid}: failed to update resume meta for {file_id}: {exc}")
 
                 if now - last_report_ts >= float(self.args.stats_interval):
                     elapsed = max(now - start_ts, 1e-6)
@@ -695,33 +870,37 @@ class RUDPFileReceiver:
                     rate_bps = (interval_bytes / interval) if interval_bytes > 0 else ((bytes_recv / elapsed) if bytes_recv > 0 else 0.0)
                     eta_text = _format_duration(remaining_bytes / rate_bps) if rate_bps > 0 else "unknown"
                     self.logger.info(
-                        f"Session {cid}: {bytes_recv}/{expected_total} bytes ({pct:.2f}%), "
-                        f"pkts={pkts_recv}, avg={avg_mbps:.2f} Mbps, interval={int_mbps:.2f} Mbps, eta={eta_text}"
+                        f"Session {cid}: offer={offer_id}, files={len(file_states)}, bytes={bytes_recv}/{expected_total} ({pct:.2f}%), "
+                        f"last_file={file_id} {task.received_bytes}/{task.size} ({task.progress_pct:.2f}%), pkts={pkts_recv}, avg={avg_mbps:.2f} Mbps, interval={int_mbps:.2f} Mbps, eta={eta_text}"
                     )
                     last_report_ts = now
                     last_report_bytes = bytes_recv
 
-            if eof_seen and header_seen and meta is not None and expected_total is not None:
-                if part_path is not None and part_path.exists():
-                    try:
-                        received_sha = sha256_file(str(part_path))
-                    except Exception:
-                        received_sha = sha.hexdigest()
-                else:
-                    received_sha = sha.hexdigest()
-                expected_sha = str(meta.get("sha256") or "").lower()
-                if bytes_recv != expected_total:
-                    exit_reason = "size_mismatch"
-                    session.abort(exit_reason)
-                    self.logger.error(f"Session {cid}: size mismatch {bytes_recv}/{expected_total}")
-                elif expected_sha and received_sha != expected_sha:
-                    exit_reason = "sha256_mismatch"
-                    session.abort(exit_reason)
-                    self.logger.error(f"Session {cid}: sha256 mismatch expected={expected_sha} got={received_sha}")
-                else:
-                    if part_path is not None and out_path is not None:
-                        os.replace(part_path, out_path)
-                        remove_resume_meta(part_path)
+            if eof_seen and offer_seen and file_states:
+                _close_all()
+                all_ok = True
+                for fid, st in list(file_states.items()):
+                    task = st.get("task")
+                    if not isinstance(task, FileTransferTask):
+                        all_ok = False
+                        continue
+                    part_path = Path(str(st.get("part_path")))
+                    out_path = Path(str(st.get("out_path")))
+                    if task.received_bytes != task.size:
+                        all_ok = False
+                        exit_reason = "size_mismatch"
+                        self.logger.error(f"Session {cid}: size mismatch file_id={fid} {task.received_bytes}/{task.size}")
+                        break
+                    received_sha = sha256_file(str(part_path))
+                    expected_sha = str(task.sha256 or "").lower()
+                    if expected_sha and received_sha != expected_sha:
+                        all_ok = False
+                        exit_reason = "sha256_mismatch"
+                        self.logger.error(f"Session {cid}: sha256 mismatch file_id={fid} expected={expected_sha} got={received_sha}")
+                        break
+                    os.replace(part_path, out_path)
+                    remove_resume_meta(part_path)
+                if all_ok:
                     complete_res = session.send_complete_commit(int(expected_total), int(bytes_recv))
                     if not bool((complete_res or {}).get("ok")):
                         exit_reason = f"complete_commit_failed:{(complete_res or {}).get('status')}"
@@ -733,10 +912,12 @@ class RUDPFileReceiver:
                         exit_reason = "complete"
                         elapsed = max(time.time() - start_ts, 1e-6)
                         self.logger.info(
-                            f"Session {cid}: saved {out_path}, bytes={bytes_recv}, "
-                            f"sha256={received_sha}, elapsed={elapsed:.3f}s, "
+                            f"Session {cid}: saved {len(file_states)} file(s), bytes={bytes_recv}, elapsed={elapsed:.3f}s, "
                             f"avg={(bytes_recv * 8.0 / elapsed / 1e6):.2f} Mbps"
                         )
+                elif exit_reason == "unknown":
+                    exit_reason = "file_verify_failed"
+                    session.abort(exit_reason)
 
         except Exception as exc:
             exit_reason = f"app_error:{exc}"
@@ -746,20 +927,17 @@ class RUDPFileReceiver:
             except Exception:
                 pass
         finally:
-            if out_f is not None:
-                try:
-                    out_f.close()
-                except Exception:
-                    pass
-            if exit_reason != "complete" and part_path is not None:
-                try:
-                    if out_path is not None and part_path.exists() and meta is not None:
-                        write_resume_meta(part_path, meta, out_path, int(bytes_recv))
-                        self.logger.info(f"Session {cid}: kept partial file for resume: {part_path}, bytes={bytes_recv}")
-                except Exception as exc:
-                    self.logger.warning(f"Session {cid}: failed to preserve resume meta: {exc}")
+            _close_all()
+            if exit_reason != "complete":
+                for fid, st in file_states.items():
+                    try:
+                        task = st.get("task")
+                        if isinstance(task, FileTransferTask):
+                            write_resume_meta(st["part_path"], st.get("meta") or {}, st["out_path"], int(task.received_bytes), task.received_ranges)
+                            self.logger.info(f"Session {cid}: kept partial file for resume: {st['part_path']}, file_id={fid}, bytes={task.received_bytes}")
+                    except Exception as exc:
+                        self.logger.warning(f"Session {cid}: failed to preserve resume meta for {fid}: {exc}")
             self.logger.info(f"Session {cid}: end reason={exit_reason}, bytes_recv={bytes_recv}")
-            # A short linger keeps the receiver alive for duplicate EOF/COMPLETE_ACK traffic.
             if exit_reason == "complete":
                 time.sleep(1.0)
             self._end_session(cid)

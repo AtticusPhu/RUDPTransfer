@@ -17,8 +17,10 @@ import re
 import subprocess
 import sys
 import threading
+import time
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 APP_NAME = "RUDPTransfer"
 IS_WINDOWS = os.name == "nt"
@@ -647,7 +649,16 @@ class RUDPTransferRoot(BoxLayout):
         self.receiver_worker = WorkerProcess("receiver", self.receiver_log, self.receiver_exit)
         self.last_sender_args: Optional[List[str]] = None
         self.last_sender_file: str = ""
+        self.last_sender_files: List[str] = []
+        self.selected_sender_files: List[str] = []
         self.last_sender_failure_code: str = ""
+        # Queues are used only for different receiver endpoints. For the same active
+        # receiver, newly selected files are appended to the running sender through
+        # its control directory and join the current FileTransferManager.
+        self.sender_queues: Dict[str, Deque[Dict[str, object]]] = {}
+        self.sender_queue_order: List[str] = []
+        self.active_sender_key: Optional[str] = None
+        self.active_sender_job: Optional[Dict[str, object]] = None
         self._build()
         self.refresh_texts()
         self.refresh_local_ips()
@@ -896,20 +907,51 @@ class RUDPTransferRoot(BoxLayout):
         self.local_ip_label.text = self.t("local_ip", ips=text)
 
     def choose_file(self) -> None:
-        self._native_file_dialog(select_dir=False, callback=lambda path: self._set_file(path))
+        self._native_file_dialog(select_dir=False, callback=lambda paths: self._set_files(paths), multiple=True)
 
     def _set_file(self, path: str) -> None:
-        self.file_input.text = path
+        self._set_files([path])
+
+    def _set_files(self, paths) -> None:
+        if isinstance(paths, (str, os.PathLike)):
+            raw = [str(paths)]
+        else:
+            raw = [str(p) for p in (paths or [])]
+        files = []
+        seen = set()
+        for item in raw:
+            item = str(item or "").strip().strip('"')
+            if not item or not os.path.isfile(item):
+                continue
+            key = item.lower() if IS_WINDOWS else item
+            if key not in seen:
+                seen.add(key)
+                files.append(item)
+        self.selected_sender_files = files
+        if not files:
+            self.file_input.text = ""
+            return
+        if len(files) == 1:
+            self.file_input.text = files[0]
+        else:
+            total = 0
+            for pth in files:
+                try:
+                    total += os.path.getsize(pth)
+                except Exception:
+                    pass
+            self.file_input.text = f"{len(files)} files selected"
+            self.sender_log_box.append(f"Selected {len(files)} files, total={total} bytes\n")
         try:
-            size = os.path.getsize(path)
-            self.update_progress_labels(0, size, 0.0, self.t("unknown"), 0.0)
+            total = sum(os.path.getsize(pth) for pth in files)
+            self.update_progress_labels(0, total, 0.0, self.t("unknown"), 0.0)
         except Exception:
             pass
 
     def choose_dir(self) -> None:
         self._native_file_dialog(select_dir=True, callback=lambda path: setattr(self.save_dir_input, "text", path))
 
-    def _native_file_dialog(self, select_dir: bool, callback) -> None:
+    def _native_file_dialog(self, select_dir: bool, callback, multiple: bool = False) -> None:
         """Use the operating system file dialog first.
 
         On Windows this gives users the familiar Explorer-style picker and
@@ -930,17 +972,28 @@ class RUDPTransferRoot(BoxLayout):
             if select_dir:
                 selected = filedialog.askdirectory(parent=root, title=self.t("choose_dir"))
             else:
-                selected = filedialog.askopenfilename(parent=root, title=self.t("choose_file"))
+                if multiple:
+                    selected = filedialog.askopenfilenames(parent=root, title=self.t("choose_file"))
+                else:
+                    selected = filedialog.askopenfilename(parent=root, title=self.t("choose_file"))
             root.destroy()
             if selected:
-                callback(str(selected))
+                if isinstance(selected, (tuple, list)):
+                    callback([str(x) for x in selected])
+                else:
+                    callback(str(selected))
             return
         except Exception:
             self.sender_log_box.append(self.t("native_dialog_failed") + "\n")
-            self._file_popup(select_dir=select_dir, callback=callback)
+            self._file_popup(select_dir=select_dir, callback=callback, multiple=multiple)
 
-    def _file_popup(self, select_dir: bool, callback) -> None:
+    def _file_popup(self, select_dir: bool, callback, multiple: bool = False) -> None:
         chooser = FileChooserListView(path=str(Path.home()), dirselect=select_dir)
+        if not select_dir:
+            try:
+                chooser.multiselect = bool(multiple)
+            except Exception:
+                pass
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         content.add_widget(chooser)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
@@ -948,7 +1001,7 @@ class RUDPTransferRoot(BoxLayout):
         def _select(_btn):
             selected = chooser.selection
             if selected:
-                callback(selected[0])
+                callback(list(selected) if multiple and not select_dir else selected[0])
                 popup.dismiss()
         buttons.add_widget(make_button("primary", text=self.t("select"), on_release=_select))
         buttons.add_widget(make_button("secondary", text=self.t("cancel"), on_release=lambda *_: popup.dismiss()))
@@ -1035,6 +1088,112 @@ class RUDPTransferRoot(BoxLayout):
 
         threading.Thread(target=_run, daemon=True).start()
 
+
+    def _sender_device_key(self, ip: str, port: int) -> str:
+        return f"{str(ip or '').strip()}:{int(port or 9999)}"
+
+    def _sender_control_dir(self, key: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key or "receiver"))
+        return user_data_dir() / "sender_controls" / safe
+
+    def _append_files_to_active_sender(self, files: List[str]) -> bool:
+        if not self.sender_worker.is_running() or not self.active_sender_job:
+            return False
+        control_dir = Path(str(self.active_sender_job.get("control_dir") or ""))
+        commands_dir = control_dir / "commands"
+        if not control_dir or not control_dir.exists():
+            return False
+        try:
+            commands_dir.mkdir(parents=True, exist_ok=True)
+            payload = {"type": "add_files", "created_at": time.time(), "files": [str(x) for x in files]}
+            tmp = commands_dir / f"add_{int(time.time() * 1000)}_{os.getpid()}.json.tmp"
+            final = commands_dir / tmp.name.replace(".json.tmp", ".json")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, final)
+            self.sender_log_box.append(f"Added {len(files)} file(s) to current transfer process.\n")
+            return True
+        except Exception as exc:
+            self.sender_log_box.append(f"Failed to append files to current transfer: {exc}\n")
+            return False
+
+    def _queued_sender_count(self, key: Optional[str] = None) -> int:
+        if key is not None:
+            return len(self.sender_queues.get(key, ()))
+        return sum(len(q) for q in self.sender_queues.values())
+
+    def _enqueue_sender_job(self, job: Dict[str, object]) -> None:
+        key = str(job.get("device_key") or "")
+        if not key:
+            return
+        if key not in self.sender_queues:
+            self.sender_queues[key] = deque()
+        if key not in self.sender_queue_order:
+            self.sender_queue_order.append(key)
+        self.sender_queues[key].append(job)
+        files = list(job.get("files") or [])
+        self.sender_log_box.append(
+            f"Queued transfer to {key}: {len(files)} file(s). "
+            f"Device queue={self._queued_sender_count(key)}, total queued={self._queued_sender_count()}\n"
+        )
+
+    def _dequeue_sender_job(self, prefer_key: Optional[str] = None) -> Optional[Dict[str, object]]:
+        keys: List[str] = []
+        if prefer_key:
+            keys.append(str(prefer_key))
+        keys.extend([k for k in self.sender_queue_order if k not in keys])
+        for key in keys:
+            q = self.sender_queues.get(key)
+            if q:
+                job = q.popleft()
+                if not q:
+                    self.sender_queues.pop(key, None)
+                    try:
+                        self.sender_queue_order.remove(key)
+                    except ValueError:
+                        pass
+                return job
+        return None
+
+    def _start_sender_job(self, job: Dict[str, object]) -> None:
+        args = list(job.get("args") or [])
+        files = [str(x) for x in (job.get("files") or [])]
+        key = str(job.get("device_key") or "")
+        total = int(job.get("total") or 0)
+        ip = str(job.get("ip") or "")
+        port = int(job.get("port") or 9999)
+        pin_file = str(job.get("pin_file") or "")
+        if not args or not files:
+            self.sender_log_box.append("Invalid queued sender job; skipped.\n")
+            return
+        self.active_sender_key = key
+        self.active_sender_job = dict(job)
+        self.last_sender_args = list(args)
+        self.last_sender_file = files[0] if files else ""
+        self.last_sender_files = list(files)
+        self.last_sender_failure_code = ""
+        self.retry_send_btn.disabled = True
+        self.progress.value = 0
+        self.update_progress_labels(0, total, 0.0, self.t("unknown"), 0.0)
+        self.sender_log_box.append(f"Starting sender to: {ip}:{port}\n")
+        self.sender_log_box.append(f"Receiver pin file: {pin_file}\n")
+        self.sender_log_box.append(f"Files: {len(files)}\n")
+        self.sender_worker.start(args)
+        self.sender_log_box.append(self.t("started") + "\n")
+        self.sender_log_box.append(self.t("request_waiting") + "\n")
+
+    def _start_next_queued_sender_job(self, prefer_key: Optional[str] = None) -> bool:
+        if self.sender_worker.is_running():
+            return False
+        job = self._dequeue_sender_job(prefer_key=prefer_key)
+        if not job:
+            return False
+        self.sender_log_box.append(
+            f"Starting next queued transfer for {job.get('device_key')}. "
+            f"Remaining queued={self._queued_sender_count()}\n"
+        )
+        self._start_sender_job(job)
+        return True
+
     def start_sender(self) -> None:
         rec = getattr(self, "selected_receiver", None)
         selected_ip = ""
@@ -1062,17 +1221,26 @@ class RUDPTransferRoot(BoxLayout):
         if not ip:
             self.sender_log_box.append(self.t("need_ip") + "\n")
             return
-        file_path = self.file_input.text.strip().strip('"')
-        if not file_path or not os.path.isfile(file_path):
+        files = list(self.selected_sender_files or [])
+        if not files:
+            file_path_text = self.file_input.text.strip().strip('"')
+            if file_path_text and os.path.isfile(file_path_text):
+                files = [file_path_text]
+        files = [str(p) for p in files if os.path.isfile(str(p))]
+        if not files:
             self.sender_log_box.append(self.t("need_file") + "\n")
             return
         pin_file = str(receiver_pin_file(ip, port_num))
-        self.sender_log_box.append(f"Starting sender to: {ip}:{port_num}\n")
-        self.sender_log_box.append(f"Receiver pin file: {pin_file}\n")
+        device_key = self._sender_device_key(ip, port_num)
+        control_dir = self._sender_control_dir(device_key)
         args = [
             "--server-ip", ip,
             "--server-port", str(port_num),
-            "--file", file_path,
+            "--control-dir", str(control_dir),
+        ]
+        for file_path in files:
+            args.extend(["--file", file_path])
+        args.extend([
             "--payload-size", self.payload_input.text.strip() or "1300",
             "--complete-timeout", self.complete_timeout_input.text.strip() or "180",
             "--final-ack-timeout", self.complete_timeout_input.text.strip() or "180",
@@ -1080,20 +1248,29 @@ class RUDPTransferRoot(BoxLayout):
             "--no-progress-timeout", "120",
             "--stats-interval", "0.5",
             "--server-pin-file", pin_file,
-        ]
-        self.last_sender_args = list(args)
-        self.last_sender_file = file_path
-        self.last_sender_failure_code = ""
-        self.retry_send_btn.disabled = True
-        self.progress.value = 0
+        ])
         try:
-            total = os.path.getsize(file_path)
-            self.update_progress_labels(0, total, 0.0, self.t("unknown"), 0.0)
+            total = sum(os.path.getsize(pth) for pth in files)
         except Exception:
-            pass
-        self.sender_worker.start(args)
-        self.sender_log_box.append(self.t("started") + "\n")
-        self.sender_log_box.append(self.t("request_waiting") + "\n")
+            total = 0
+        job: Dict[str, object] = {
+            "device_key": device_key,
+            "ip": ip,
+            "port": int(port_num),
+            "pin_file": pin_file,
+            "control_dir": str(control_dir),
+            "files": list(files),
+            "args": list(args),
+            "total": int(total),
+            "created_at": time.time(),
+        }
+        if self.sender_worker.is_running():
+            if self.active_sender_key == device_key:
+                self._append_files_to_active_sender(files)
+                return
+            self._enqueue_sender_job(job)
+            return
+        self._start_sender_job(job)
 
     def retry_sender(self) -> None:
         if self.sender_worker.is_running():
@@ -1102,14 +1279,15 @@ class RUDPTransferRoot(BoxLayout):
         if not self.last_sender_args:
             self.sender_log_box.append(self.t("need_file") + "\n")
             return
-        if self.last_sender_file and not os.path.isfile(self.last_sender_file):
+        last_files = list(getattr(self, "last_sender_files", []) or ([self.last_sender_file] if self.last_sender_file else []))
+        if any(not os.path.isfile(str(p)) for p in last_files):
             self.sender_log_box.append(self.t("need_file") + "\n")
             return
         self.retry_send_btn.disabled = True
         self.last_sender_failure_code = ""
         self.progress.value = 0
         try:
-            total = os.path.getsize(self.last_sender_file) if self.last_sender_file else 0
+            total = sum(os.path.getsize(str(p)) for p in last_files)
             self.update_progress_labels(0, total, 0.0, self.t("unknown"), 0.0)
         except Exception:
             pass
@@ -1276,6 +1454,17 @@ class RUDPTransferRoot(BoxLayout):
         lbl = make_label(text=message, halign="left", valign="top")
         bind_label_wrap(lbl)
         content.add_widget(lbl)
+        if bool(req.get("storage_warning")):
+            warn = self.t(
+                "storage_warning",
+                free=format_file_size(int(req.get("storage_free_bytes") or 0)),
+                file_size=format_file_size(int(req.get("storage_file_bytes") or req.get("size") or 0)),
+                reserve=format_file_size(int(req.get("storage_reserve_bytes") or 0)),
+                threshold=format_file_size(int(req.get("storage_threshold_bytes") or 0)),
+            )
+            warn_lbl = make_label(text=warn, halign="left", valign="top", color=(1.0, 0.72, 0.25, 1))
+            bind_label_wrap(warn_lbl)
+            content.add_widget(warn_lbl)
         policy_spinner = None
         resume_available = bool(req.get("resume_available"))
         if resume_available:
@@ -1349,15 +1538,27 @@ class RUDPTransferRoot(BoxLayout):
         popup.open()
 
     def sender_exit(self, rc) -> None:
+        finished_key = self.active_sender_key
+        self.active_sender_key = None
+        self.active_sender_job = None
         self.sender_log_box.append(f"Process exited, rc={rc}\n")
         if int(rc or 0) == 0:
             self.sender_log_box.append(self.t("transfer_finished") + "\n")
             self.retry_send_btn.disabled = True
+            if self._start_next_queued_sender_job(prefer_key=finished_key):
+                return
+            if self._queued_sender_count() > 0:
+                self.sender_log_box.append(f"Queued transfers remaining: {self._queued_sender_count()}\n")
         else:
             if not self.last_sender_failure_code:
                 self._display_user_error("transfer_failed", "", target="sender")
             else:
                 self.retry_send_btn.disabled = False
+            if self._queued_sender_count() > 0:
+                self.sender_log_box.append(
+                    f"Current transfer failed; queued transfers are kept pending ({self._queued_sender_count()}). "
+                    f"Start or retry after resolving the failure.\n"
+                )
 
     def receiver_exit(self, rc) -> None:
         self.receiver_log_box.append(f"Process exited, rc={rc}\n")

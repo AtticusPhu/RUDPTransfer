@@ -18,26 +18,45 @@ for _stream_name in ("stdout", "stderr"):
             pass
 
 import argparse
+import json
 import math
 import os
 import secrets
 import socket
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from congestion import CubicCongestionControl
 from file_transfer_common import (
+    BATCH_TRANSFER_STATUS_ACTIVE,
     DATA_SEQ_UPPER_EXCLUSIVE,
     EOF_PAYLOAD,
+    FILE_BODY_OFFSET_HEADER_LEN,
+    FILE_TRANSFER_STATUS_ACTIVE,
     MAX_DATA_SEQ,
     SEQ_FIRST_BODY,
     SEQ_HEADER,
+    TRANSFER_MODE_LARGE_RANGE,
+    BatchTransferTask,
+    FileBatchScheduler,
+    FileTransferTask,
+    choose_file_transfer_slice_bytes,
+    build_file_body_frame,
     build_file_header,
+    build_file_offer,
+    build_file_offer_item,
     build_user_error,
     build_user_status,
+    classify_file_transfer_network_state,
+    consume_scheduled_range,
+    missing_ranges_from_received,
+    normalize_ranges,
+    parse_file_offer_accept,
     parse_transfer_decision,
     print_local_ip_candidates,
+    ranges_total_bytes,
+    schedule_missing_ranges,
     sha256_file,
 )
 from protocol import (
@@ -163,10 +182,10 @@ def _format_duration(seconds: float) -> str:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Send one file through the RUDP protocol.")
+    p = argparse.ArgumentParser(description="Send one or more files through the RUDP protocol.")
     p.add_argument("--server-ip", required=True, help="Receiver IP or hostname")
     p.add_argument("--server-port", type=int, default=9999, help="Receiver UDP port")
-    p.add_argument("--file", required=True, help="File to send")
+    p.add_argument("--file", action="append", required=True, help="File to send; repeat this option for multi-file transfer")
     p.add_argument("--bind-ip", default="0.0.0.0", help="Local bind IP; usually keep 0.0.0.0")
     p.add_argument("--bind-port", type=int, default=0, help="Local bind port; 0 means auto")
     p.add_argument("--payload-size", type=int, default=1300, help="Application payload bytes per DATA packet")
@@ -191,6 +210,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-data-rto-sec", type=float, default=4.0)
     p.add_argument("--show-ips", action="store_true", help="Print local IP candidates before sending")
     p.add_argument("--verbose-protocol", action="store_true", help="Show high-volume internal ACK logs")
+    p.add_argument("--control-dir", default="", help="Directory used by GUI to add files to this running sender")
+    p.add_argument("--idle-add-timeout", type=float, default=1.0, help="When current work is done, wait this many seconds for GUI add-file commands before sending EOF")
     return p
 
 
@@ -245,11 +266,22 @@ def _wait_for_receiver_decision(session: ReliableUDPSession, timeout: float, log
         _seq, data_or_len, is_len = item
         if is_len:
             continue
+        raw = bytes(data_or_len or b"")
         try:
-            decision = parse_transfer_decision(bytes(data_or_len or b""))
+            decision = parse_file_offer_accept(raw)
         except Exception:
-            continue
+            try:
+                decision = parse_transfer_decision(raw)
+            except Exception:
+                continue
         if bool(decision.get("accepted")):
+            accepted_files = decision.get("accepted_files") if isinstance(decision.get("accepted_files"), list) else []
+            if accepted_files:
+                first = accepted_files[0]
+                if isinstance(first, dict):
+                    for key in ("resume_offset", "resume_pct", "resume", "received_ranges", "missing_ranges", "received_bytes_total", "transfer_mode", "file_id", "receiver_file_key", "content_file_key"):
+                        if key in first and key not in decision:
+                            decision[key] = first.get(key)
             resume_offset = max(0, int(decision.get("resume_offset") or 0))
             if bool(decision.get("resume")) and resume_offset > 0:
                 logger.info(
@@ -268,6 +300,103 @@ def _wait_for_receiver_decision(session: ReliableUDPSession, timeout: float, log
 
 
 
+def _collect_input_files(raw_files) -> List[Path]:
+    if isinstance(raw_files, (str, bytes, os.PathLike)):
+        values = [raw_files]
+    else:
+        values = list(raw_files or [])
+    out: List[Path] = []
+    seen = set()
+    for raw in values:
+        text = str(raw or "").strip().strip('"')
+        if not text:
+            continue
+        # GUI may pass a semicolon-separated list for compatibility with older
+        # packaged builds; repeated --file arguments are preferred.
+        candidates = [text]
+        if ";" in text and not os.path.exists(text):
+            candidates = [x.strip().strip('"') for x in text.split(";") if x.strip()]
+        for item in candidates:
+            pth = Path(item).expanduser().resolve()
+            if not pth.is_file():
+                raise FileNotFoundError(str(pth))
+            key = str(pth).lower() if os.name == "nt" else str(pth)
+            if key not in seen:
+                seen.add(key)
+                out.append(pth)
+    if not out:
+        raise FileNotFoundError("no input files")
+    return out
+
+
+
+def _prepare_offer_items(input_files: List[Path], payload_size: int, logger) -> Tuple[List[Dict[str, object]], Dict[str, Path], Dict[str, Path], int]:
+    offer_items: List[Dict[str, object]] = []
+    local_by_file_id: Dict[str, Path] = {}
+    local_by_content_key: Dict[str, Path] = {}
+    total_offer_bytes = 0
+    for input_file in input_files:
+        input_file = Path(input_file).expanduser().resolve()
+        total_offer_bytes += int(input_file.stat().st_size)
+        logger.info(f"Calculating SHA256: {input_file}")
+        file_sha256 = sha256_file(str(input_file))
+        item = build_file_offer_item(str(input_file), payload_size=payload_size, sha256_hex=file_sha256, relative_path=input_file.name)
+        offer_items.append(item)
+        local_by_file_id[str(item.get("file_id") or "")] = input_file
+        local_by_content_key[str(item.get("content_file_key") or "")] = input_file
+        logger.info(
+            f"Prepared file offer item: {input_file.name}, size={int(item.get('size') or 0)} bytes, "
+            f"sha256={file_sha256}, transfer_mode={item.get('transfer_mode')}, file_id={item.get('file_id')}"
+        )
+    return offer_items, local_by_file_id, local_by_content_key, int(total_offer_bytes)
+
+
+def _control_dirs(raw_dir: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    text = str(raw_dir or "").strip()
+    if not text:
+        return None, None, None
+    root = Path(text).expanduser().resolve()
+    incoming = root / "commands"
+    done = root / "done"
+    incoming.mkdir(parents=True, exist_ok=True)
+    done.mkdir(parents=True, exist_ok=True)
+    return root, incoming, done
+
+
+def _read_next_add_files_command(commands_dir: Optional[Path], done_dir: Optional[Path], logger) -> Optional[List[Path]]:
+    if commands_dir is None:
+        return None
+    try:
+        files = sorted(commands_dir.glob("add_*.json"), key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return None
+    for pth in files:
+        try:
+            obj = json.loads(pth.read_text(encoding="utf-8"))
+            raw_files = obj.get("files") if isinstance(obj, dict) else []
+            paths = _collect_input_files(raw_files)
+            target = (done_dir / (pth.name + ".done")) if done_dir is not None else None
+            if target is not None:
+                try:
+                    pth.replace(target)
+                except Exception:
+                    pth.unlink(missing_ok=True)
+            else:
+                pth.unlink(missing_ok=True)
+            logger.info(f"Loaded add-files command: {len(paths)} file(s)")
+            return paths
+        except Exception as exc:
+            logger.warning(f"Ignoring invalid add-files command {pth}: {exc}")
+            try:
+                bad = (done_dir / (pth.name + ".bad")) if done_dir is not None else None
+                if bad is not None:
+                    pth.replace(bad)
+                else:
+                    pth.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return None
+
 def run_client(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "verbose_protocol", False)):
         os.environ.setdefault("RUDP_VERBOSE_PROTOCOL", "0")
@@ -275,10 +404,7 @@ def run_client(args: argparse.Namespace) -> int:
     if args.show_ips:
         print_local_ip_candidates()
 
-    input_file = Path(args.file).expanduser().resolve()
-    if not input_file.is_file():
-        raise FileNotFoundError(str(input_file))
-
+    input_files = _collect_input_files(args.file)
     payload_size = int(args.payload_size)
     if payload_size <= 0 or payload_size > MAX_DATA_APP_PAYLOAD:
         raise ValueError(
@@ -293,22 +419,28 @@ def run_client(args: argparse.Namespace) -> int:
             )
         )
 
-    total_bytes = input_file.stat().st_size
-    logger.info(f"Calculating SHA256: {input_file}")
-    file_sha256 = sha256_file(str(input_file))
-    header_msg = build_file_header(str(input_file), payload_size=payload_size, sha256_hex=file_sha256)
-    if len(header_msg) > MAX_DATA_APP_PAYLOAD:
-        raise ValueError(f"file metadata header too large: {len(header_msg)} bytes")
+    # FILE_BODY frames carry file_id + offset. Keep payload size conservative.
+    estimated_body_overhead = FILE_BODY_OFFSET_HEADER_LEN + 1 + 128
+    if payload_size + estimated_body_overhead > MAX_DATA_APP_PAYLOAD:
+        raise ValueError(f"payload-size too large for FILE_BODY offset/file_id frame: {payload_size}")
+
+    offer_items, local_by_file_id, local_by_content_key, total_offer_bytes = _prepare_offer_items(input_files, payload_size, logger)
+    control_root, control_commands_dir, control_done_dir = _control_dirs(str(getattr(args, "control_dir", "") or ""))
+    if control_root is not None:
+        logger.info(f"Sender control directory enabled: {control_root}")
+
+    offer_msg = build_file_offer(offer_items)
+    if len(offer_msg) > MAX_DATA_APP_PAYLOAD:
+        raise ValueError(f"file offer too large for one metadata frame: {len(offer_msg)} bytes; select fewer files or compress them")
 
     max_total_data_pkts = MAX_DATA_SEQ - SEQ_FIRST_BODY
     max_total_bytes = max_total_data_pkts * int(payload_size)
-    if total_bytes > max_total_bytes:
-        raise ValueError(f"file too large for DATA sequence space; max_total_bytes={max_total_bytes}")
+    if total_offer_bytes > max_total_bytes:
+        raise ValueError(f"selected files too large for DATA sequence space; max_total_bytes={max_total_bytes}")
 
     sock = None
     session = None
     start_ts = time.time()
-    resume_offset = 0
     bytes_sent = 0
     pkts_sent = 0
     last_report_ts = start_ts
@@ -342,7 +474,7 @@ def run_client(args: argparse.Namespace) -> int:
         sock.bind((str(args.bind_ip), int(args.bind_port)))
         logger.info(f"Local socket: {sock.getsockname()}")
         logger.info(f"Receiver: {(args.server_ip, args.server_port)}")
-        logger.info(f"File: {input_file.name}, size={total_bytes} bytes, sha256={file_sha256}")
+        logger.info(f"Offer: files={len(offer_items)}, total_size={total_offer_bytes} bytes")
 
         conn_id = secrets.randbits(64)
         validator = make_server_identity_validator(
@@ -398,6 +530,57 @@ def run_client(args: argparse.Namespace) -> int:
                 byte_pacer.wait(wire_size)
             session.send_app_data(seq, payload)
 
+        def _tasks_from_decision(decision: Dict[str, object], items: List[Dict[str, object]], by_file_id: Dict[str, Path], by_content_key: Dict[str, Path]) -> Tuple[List[FileTransferTask], int, int]:
+            accepted_files = decision.get("accepted_files") if isinstance(decision.get("accepted_files"), list) else []
+            out_tasks: List[FileTransferTask] = []
+            accepted_total = 0
+            already_received = 0
+            for accepted in accepted_files:
+                if not isinstance(accepted, dict):
+                    continue
+                file_id = str(accepted.get("file_id") or "")
+                content_key = str(accepted.get("content_file_key") or "")
+                local_path = by_file_id.get(file_id) or by_content_key.get(content_key)
+                if local_path is None:
+                    logger.warning(f"Receiver accepted unknown file_id={file_id} content_key={content_key}; skipping")
+                    continue
+                size = int(local_path.stat().st_size)
+                accepted_total += size
+                transfer_mode = str(accepted.get("transfer_mode") or "")
+                if not transfer_mode:
+                    for item in items:
+                        if str(item.get("file_id") or "") == file_id or str(item.get("content_file_key") or "") == content_key:
+                            transfer_mode = str(item.get("transfer_mode") or "small_sequential")
+                            break
+                received_ranges = normalize_ranges(accepted.get("received_ranges") or [], size)
+                missing_ranges = normalize_ranges(accepted.get("missing_ranges") or [], size)
+                if not missing_ranges:
+                    missing_ranges = missing_ranges_from_received(received_ranges, size)
+                task = FileTransferTask(
+                    transfer_id=str(accepted.get("transfer_id") or accepted.get("sha256") or content_key),
+                    file_id=file_id or content_key[:24],
+                    path=str(local_path),
+                    size=size,
+                    sha256=str(next((x.get("sha256") for x in items if str(x.get("file_id") or "") == file_id), "") or ""),
+                    mode=transfer_mode or "small_sequential",
+                    received_ranges=received_ranges,
+                    missing_ranges=missing_ranges,
+                    status=FILE_TRANSFER_STATUS_ACTIVE,
+                    relative_path=str(accepted.get("relative_path") or local_path.name),
+                    content_file_key=content_key,
+                    receiver_file_key=str(accepted.get("receiver_file_key") or ""),
+                )
+                already_received += int(task.received_bytes)
+                if task.missing_ranges:
+                    out_tasks.append(task)
+                else:
+                    logger.info(f"File already complete at receiver: {task.relative_path}")
+            return out_tasks, int(accepted_total), int(already_received)
+
+        total_bytes = total_offer_bytes
+        total_body_bytes_to_send = total_offer_bytes
+        file_count_for_report = len(offer_items)
+
         def report(force: bool = False) -> None:
             nonlocal last_report_ts, last_report_bytes
             now = time.time()
@@ -416,56 +599,143 @@ def run_client(args: argparse.Namespace) -> int:
             note_effective_progress(unacked_count)
             logger.info(
                 f"Progress: {bytes_sent}/{total_bytes} bytes ({pct:.2f}%), "
-                f"pkts={pkts_sent}, avg={avg_mbps:.2f} Mbps, interval={int_mbps:.2f} Mbps, "
+                f"files={file_count_for_report}, pkts={pkts_sent}, avg={avg_mbps:.2f} Mbps, interval={int_mbps:.2f} Mbps, "
                 f"eta={eta_text}, unacked={unacked_count}"
             )
             last_report_ts = now
             last_report_bytes = bytes_sent
 
-        send_payload(SEQ_HEADER, header_msg)
-        decision = {}
+        send_payload(SEQ_HEADER, offer_msg)
+        decision: Dict[str, object] = {}
         if not bool(getattr(args, "no_request_confirmation", False)):
             decision = _wait_for_receiver_decision(session, float(args.request_timeout), logger)
 
-        resume_offset = max(0, int((decision or {}).get("resume_offset") or 0))
-        if resume_offset > total_bytes:
-            resume_offset = 0
-        # Keep the implicit offset protocol on clean payload boundaries.
-        if resume_offset > 0:
-            resume_offset -= resume_offset % payload_size
-        remaining_bytes_total = max(0, int(total_bytes) - int(resume_offset))
-        remaining_pkts = int(math.ceil(remaining_bytes_total / payload_size)) if remaining_bytes_total > 0 else 0
-        seq_eof = SEQ_FIRST_BODY + remaining_pkts
-        if seq_eof >= DATA_SEQ_UPPER_EXCLUSIVE:
-            raise ValueError(f"remaining file portion too large for DATA sequence space; seq_eof={seq_eof}")
+        tasks, accepted_total_bytes, already_received_bytes = _tasks_from_decision(decision, offer_items, local_by_file_id, local_by_content_key)
+        bytes_sent = int(already_received_bytes)
+        if accepted_total_bytes > 0:
+            total_bytes = int(accepted_total_bytes)
+        if not tasks:
+            logger.info("All initially accepted files were already complete at receiver")
 
-        session.set_complete_expectations(seq_eof, total_bytes)
-        session.send_range_announce(SEQ_HEADER, seq_eof)
-
-        bytes_sent = int(resume_offset)
-        last_report_bytes = int(resume_offset)
-        if resume_offset > 0:
-            logger.info(f"Resume enabled: offset={resume_offset}/{total_bytes} bytes ({resume_offset * 100.0 / max(total_bytes, 1):.2f}%)")
-        report(force=True)
-
+        scheduler = FileBatchScheduler(tasks, max_active_files=20)
         seq = SEQ_FIRST_BODY
-        with open(input_file, "rb") as f:
-            if resume_offset > 0:
-                f.seek(resume_offset)
-            while True:
-                chunk = f.read(payload_size)
-                if not chunk:
-                    break
-                send_payload(seq, chunk)
-                bytes_sent += len(chunk)
-                pkts_sent += 1
-                seq += 1
-                last_effective_progress_ts = time.time()
-                report(force=False)
-                check_no_progress("transferring")
+        logger.info(
+            f"Accepted files: active={scheduler.active_count}, pending={scheduler.pending_count}, "
+            f"missing_bytes={sum(sum(end - start for start, end in task.missing_ranges) for task in scheduler.files.values())}"
+        )
 
-        if seq != seq_eof:
-            raise AssertionError(f"seq mismatch: seq={seq}, expected={seq_eof}")
+        _last_sched_snapshot: Optional[Dict[str, object]] = None
+        last_scheduler_log_ts = 0.0
+
+        def _scheduler_network_info() -> Tuple[Dict[str, object], Dict[str, object]]:
+            nonlocal _last_sched_snapshot
+            try:
+                snap = session.get_stats_snapshot()
+            except Exception:
+                snap = {}
+            info = classify_file_transfer_network_state(snap, _last_sched_snapshot)
+            _last_sched_snapshot = dict(snap or {})
+            return info, dict(snap or {})
+
+        idle_empty_since: Optional[float] = None
+
+        def _process_add_files_command() -> bool:
+            nonlocal seq, total_bytes, bytes_sent, total_body_bytes_to_send, file_count_for_report
+            add_paths = _read_next_add_files_command(control_commands_dir, control_done_dir, logger)
+            if not add_paths:
+                return False
+            new_items, by_fid, by_ckey, offer_total = _prepare_offer_items(add_paths, payload_size, logger)
+            offer = build_file_offer(new_items)
+            if len(offer) > MAX_DATA_APP_PAYLOAD:
+                logger.error(build_user_error("file_offer_too_large", "Additional file offer is too large", str(len(offer))))
+                return False
+            logger.info(f"Adding files to running transfer: files={len(new_items)}, total_size={offer_total}")
+            send_payload(seq, offer)
+            seq += 1
+            decision2 = _wait_for_receiver_decision(session, timeout=float(args.request_timeout), logger=logger)
+            new_tasks, accepted_total, already_received = _tasks_from_decision(decision2, new_items, by_fid, by_ckey)
+            total_bytes += int(accepted_total)
+            bytes_sent += int(already_received)
+            total_body_bytes_to_send += sum(sum(end - start for start, end in task.missing_ranges) for task in new_tasks)
+            file_count_for_report += len(new_items)
+            for task in new_tasks:
+                scheduler.add_file(task)
+            logger.info(f"Added accepted files to active transfer: new_tasks={len(new_tasks)}, active={scheduler.active_count}, pending={scheduler.pending_count}")
+            return True
+
+        while True:
+            _process_add_files_command()
+            if not scheduler.has_work():
+                if idle_empty_since is None:
+                    idle_empty_since = time.time()
+                if _process_add_files_command():
+                    idle_empty_since = None
+                    continue
+                if time.time() - idle_empty_since >= max(0.1, float(getattr(args, "idle_add_timeout", 1.0) or 1.0)):
+                    break
+                report(force=False)
+                time.sleep(0.1)
+                continue
+            idle_empty_since = None
+            active_task = scheduler.next_task()
+            if active_task is None:
+                time.sleep(0.05)
+                continue
+            pending_ranges = normalize_ranges(active_task.missing_ranges, active_task.size)
+            if not pending_ranges:
+                scheduler.mark_completed(active_task.file_id)
+                continue
+            net_info, _snap = _scheduler_network_info()
+            network_mode = str(net_info.get("mode") or "stable")
+            if active_task.mode == TRANSFER_MODE_LARGE_RANGE:
+                ordered = schedule_missing_ranges(pending_ranges, active_task.size, received_bytes=int(active_task.received_bytes), network_mode=network_mode)
+            else:
+                ordered = pending_ranges
+            if not ordered:
+                scheduler.mark_completed(active_task.file_id)
+                continue
+            selected_start, selected_end = int(ordered[0][0]), int(ordered[0][1])
+            slice_bytes = max(int(payload_size), int(choose_file_transfer_slice_bytes(active_task.size)))
+            if active_task.mode == TRANSFER_MODE_LARGE_RANGE:
+                slice_bytes = min(slice_bytes, max(int(payload_size), int(net_info.get("slice_bytes") or slice_bytes)))
+            # Credit keeps all active files moving; if a task has low credit, still
+            # allow at least one packet once selected so large files do not stall.
+            if active_task.scheduler_credit > payload_size:
+                slice_bytes = min(slice_bytes, max(int(payload_size), int(active_task.scheduler_credit)))
+            send_until = min(selected_end, selected_start + slice_bytes)
+            now = time.time()
+            if (now - last_scheduler_log_ts) >= 10.0:
+                logger.info(
+                    f"File scheduler: active={scheduler.active_count}, pending={scheduler.pending_count}, "
+                    f"file={active_task.relative_path}, mode={network_mode}, selected=[{selected_start},{selected_end}), "
+                    f"slice_until={send_until}, credit={active_task.scheduler_credit:.0f}"
+                )
+                last_scheduler_log_ts = now
+            with open(active_task.path, "rb") as f:
+                offset = selected_start
+                f.seek(offset)
+                while offset < send_until:
+                    read_size = min(int(payload_size), int(send_until) - offset)
+                    chunk = f.read(read_size)
+                    if not chunk:
+                        break
+                    send_payload(seq, build_file_body_frame(offset, chunk, active_task.file_id))
+                    bytes_sent += len(chunk)
+                    pkts_sent += 1
+                    seq += 1
+                    offset += len(chunk)
+                    active_task.add_received_range(offset - len(chunk), offset)
+                    active_task.set_missing_ranges(consume_scheduled_range(active_task.missing_ranges, [selected_start, selected_end], offset, active_task.size))
+                    scheduler.note_slice_sent(active_task.file_id, len(chunk))
+                    last_effective_progress_ts = time.time()
+                    report(force=False)
+                    check_no_progress("transferring")
+            if offset <= selected_start:
+                raise IOError(f"failed to read scheduled range at file={active_task.relative_path} offset={selected_start}")
+            if active_task.is_complete() or not active_task.missing_ranges:
+                scheduler.mark_completed(active_task.file_id)
+
+        seq_eof = seq
 
         drain_start = time.time()
         while session.get_unacked_count() > 0:
@@ -513,7 +783,7 @@ def run_client(args: argparse.Namespace) -> int:
             raise RuntimeError(f"receiver COMPLETE mismatch: {complete_info}")
 
         elapsed = max(time.time() - start_ts, 1e-6)
-        logger.info(f"Transfer complete: {bytes_sent} bytes in {elapsed:.3f}s, avg={((max(0, bytes_sent - resume_offset)) * 8.0 / elapsed / 1e6):.2f} Mbps")
+        logger.info(f"Transfer complete: {bytes_sent} bytes in {elapsed:.3f}s, avg={(max(0, total_body_bytes_to_send) * 8.0 / elapsed / 1e6):.2f} Mbps")
         return 0
 
     finally:
@@ -527,7 +797,6 @@ def run_client(args: argparse.Namespace) -> int:
                 sock.close()
         except Exception:
             pass
-
 
 def _classify_user_error(exc: Exception) -> tuple[str, str]:
     text = str(exc or "")
